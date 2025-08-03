@@ -12,7 +12,5 @@ fn main() -> Result<(), Box<dyn Error>> {
             &["proto"],                  // include paths
         )?;
 
-    tonic_build::compile_protos("proto/calculator.proto")?;
-
     Ok(())
 }

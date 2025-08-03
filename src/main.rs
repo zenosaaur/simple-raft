@@ -35,10 +35,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let calc = CalculatorService::default();
 
+    let service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+        .build()?;
+
     Server::builder()
+        .add_service(service)
         .add_service(CalculatorServer::new(calc))
         .serve(addr)
         .await?;
-
     Ok(())
 }
