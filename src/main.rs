@@ -14,7 +14,7 @@ mod proto;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
+    let addr = "[::1]:8080".parse()?;
     let node_state: state::RaftNode;
     let file_path = "state.json";
     

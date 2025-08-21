@@ -1,0 +1,42 @@
+version: '3.8'
+services:
+  raft-node-1:
+    build: .
+    container_name: raft_node_1
+    working_dir: /usr/src/node-1
+    environment:
+      - RAFT_PORT=8080
+    ports:
+      - "${NODE_1_PORT}:8080"
+    volumes:
+      - .:/usr/src/node-1
+    networks:
+      - raft_network
+    command: ["sh", "-c", "cargo run --bin server --release node01 node02 node03" ]
+  raft-node-2:
+    build: .
+    container_name: raft_node_2
+    working_dir: /usr/src/node-2
+    environment:
+      - RAFT_PORT=8081
+    ports:
+      - "${NODE_2_PORT}:8080"
+    volumes:
+      - .:/usr/src/node-2
+    networks:
+      - raft_network
+    command: ["sh", "-c", "cargo run --bin server --release"]
+  raft-node-3:
+    build: .
+    container_name: raft_node_3
+    working_dir: /usr/src/node-3
+    ports:
+      - "${NODE_3_PORT}:8080"
+    volumes:
+      - .:/usr/src/node-3
+    networks:
+      - raft_network
+    command: ["sh", "-c", "cargo run --bin server --release"]
+networks:
+  raft_network:
+    driver: bridge

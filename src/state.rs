@@ -3,7 +3,7 @@ use tokio::sync::mpsc;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 
-#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default,PartialEq)]
 pub enum RaftRole {
     Follower,
     #[default]
