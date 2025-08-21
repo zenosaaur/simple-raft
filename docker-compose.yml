@@ -9,31 +9,31 @@ services:
     ports:
       - "${NODE_1_PORT}:8080"
     volumes:
-      - .:/usr/src/node-1
+      - .:/usr/src/app:z
     networks:
       - raft_network
     command: ["sh", "-c", "cargo run --bin server --release node01 node02 node03" ]
   raft-node-2:
     build: .
     container_name: raft_node_2
-    working_dir: /usr/src/node-2
+    working_dir: /usr/src/app
     environment:
       - RAFT_PORT=8081
     ports:
       - "${NODE_2_PORT}:8080"
     volumes:
-      - .:/usr/src/node-2
+      - .:/usr/src/app:z
     networks:
       - raft_network
     command: ["sh", "-c", "cargo run --bin server --release"]
   raft-node-3:
     build: .
     container_name: raft_node_3
-    working_dir: /usr/src/node-3
+    working_dir: /usr/src/app
     ports:
       - "${NODE_3_PORT}:8080"
     volumes:
-      - .:/usr/src/node-3
+      - .:/usr/src/app:z
     networks:
       - raft_network
     command: ["sh", "-c", "cargo run --bin server --release"]
