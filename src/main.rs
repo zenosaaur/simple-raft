@@ -2,7 +2,8 @@ use proto::raft_server::{Raft, RaftServer};
 use tokio::sync::mpsc;
 use std::fs::File;
 use std::io::BufReader;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+use tokio::sync::{Mutex};
 use tonic::transport::Server;
 use uuid::Uuid;
 
@@ -45,9 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Crea lo stato condiviso e mutabile
     let shared_node_state = Arc::new(Mutex::new(node_state));
-
+    let (reset_timer_tx, reset_timer_rx) = mpsc::channel(32); 
     let raft_service = server::RaftService {
         node: shared_node_state.clone(),
+        reset_timer_tx
     };
 
     let reflection_service = tonic_reflection::server::Builder::configure()

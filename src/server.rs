@@ -1,10 +1,14 @@
-use std::sync::{Arc, Mutex};
-use crate::{proto, Raft};
-use crate::state::{RaftNode,RaftRole,LogEntry};
+use tokio::sync::mpsc;
+
+use crate::state::{LogEntry, RaftNode, RaftRole};
+use crate::{Raft, proto};
+use std::sync::{Arc};
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct RaftService {
     pub node: Arc<Mutex<RaftNode>>,
+    pub reset_timer_tx: mpsc::Sender<()>,
 }
 
 #[tonic::async_trait]
@@ -13,9 +17,9 @@ impl Raft for RaftService {
         &self,
         request: tonic::Request<proto::AppendEntriesRequest>,
     ) -> Result<tonic::Response<proto::AppendEntriesResponse>, tonic::Status> {
-        let mut node = self.node.lock().unwrap();
         let req = request.into_inner();
 
+        let mut node = self.node.lock().await;
         // Regola Raft #1: Rispondi 'false' se il termine del richiedente è obsoleto.
         if req.term < node.persistent.current_term {
             return Ok(tonic::Response::new(proto::AppendEntriesResponse {
@@ -23,6 +27,8 @@ impl Raft for RaftService {
                 success: false,
             }));
         }
+        println!("[RPC] Ricevuto AppendEntries dal leader. Resetto il timer.");
+        self.reset_timer_tx.send(()).await.unwrap();
 
         // Se il termine del leader è più nuovo, aggiorna il nostro e diventa follower.
         if req.term > node.persistent.current_term {
@@ -122,7 +128,7 @@ impl Raft for RaftService {
         &self,
         request: tonic::Request<proto::RequestVoteRequest>,
     ) -> Result<tonic::Response<proto::RequestVoteResponse>, tonic::Status> {
-        let mut node = self.node.lock().unwrap();
+        let mut node = self.node.lock().await;
         let req = request.into_inner();
 
         if req.term < node.persistent.current_term {
@@ -137,21 +143,22 @@ impl Raft for RaftService {
             node.persistent.voted_for = None;
             node.volatile.role = RaftRole::Follower;
         }
-        
+
+        println!("[RPC] Received RequestVote from candidate. Resetting election timer.");
+        self.reset_timer_tx.send(()).await.unwrap();
+
         let can_vote = match &node.persistent.voted_for {
             Some(voted_id) => *voted_id == req.candidate_id,
             None => true,
         };
-        
+
         if !can_vote {
             return Ok(tonic::Response::new(proto::RequestVoteResponse {
                 term: node.persistent.current_term,
                 vote_granted: false,
             }));
         }
-        
-        // Condition B: Check if the candidate's log is at least as up-to-date as ours.
-        // This is the crucial safety rule in Raft leader election.
+
         let last_log_entry = node.persistent.log.last();
         let last_log_term = last_log_entry.map_or(0, |entry| entry.term);
         let last_log_index = node.persistent.log.len() as u64;
@@ -165,10 +172,9 @@ impl Raft for RaftService {
             }));
         }
 
-        // 3. If both conditions passed, grant the vote.
         node.persistent.voted_for = Some(req.candidate_id);
         node.persist();
-        
+
         Ok(tonic::Response::new(proto::RequestVoteResponse {
             term: node.persistent.current_term,
             vote_granted: true,
