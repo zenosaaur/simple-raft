@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::state::{LogEntry, RaftNode, RaftRole};
+use crate::state::{LogEntry, RaftEvent, RaftNode, RaftRole};
 use crate::{Raft, proto};
 use std::sync::{Arc};
 use tokio::sync::Mutex;

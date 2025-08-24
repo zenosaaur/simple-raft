@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tonic::client;
 use std::fs::File;
-use std::sync::{Arc, Mutex};
 
-#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default,PartialEq)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq)]
 pub enum RaftRole {
     Follower,
     #[default]
@@ -25,14 +24,14 @@ pub struct LogEntry {
     pub command: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default,Clone)]
 pub struct RaftVolatileState {
     pub role: RaftRole,
     pub commit_index: u64,
     pub last_applied: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct RaftNode {
     pub persistent: RaftPersistentState,
     pub volatile: RaftVolatileState,
@@ -50,3 +49,4 @@ impl RaftNode {
 pub enum RaftEvent {
     ElectionTimeout,
 }
+
