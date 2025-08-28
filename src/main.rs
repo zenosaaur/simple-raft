@@ -53,15 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_state.persist()?;
     }
 
-    // --- 3. Setup Shared State, Channels, and Peers ---
     let shared_node_state = Arc::new(Mutex::new(node_state));
     
-    // Fix: Define the channels only once
     let (event_tx, event_rx) = mpsc::channel::<RaftEvent>(100);
     let (reset_timer_tx, reset_timer_rx) = mpsc::channel::<()>(10);
 
     // Improvement: More robust peer handling
-    let peers_str = "8080,8081,8082";
+    let peers_str = "http://0.0.0.0:8080,http://0.0.0.0:8081,http://0.0.0.0:8082";
     let available_followers: Vec<String> = if peers_str.is_empty() {
         Vec::new()
     } else {
@@ -82,8 +80,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[Main] Election timer task started.");
 
     let raft_node_arc = shared_node_state.clone();
+    let event_tx_clone = event_tx.clone(); 
     tokio::spawn(async move {
-        run_raft_node(raft_node_arc, event_rx, reset_timer_tx, available_followers).await;
+        run_raft_node(raft_node_arc, event_rx, reset_timer_tx, event_tx_clone, available_followers).await;
     });
     println!("[Main] Raft state machine task started.");
 

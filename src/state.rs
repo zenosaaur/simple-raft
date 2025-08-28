@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
+use tonic::Status;
 use std::{collections::HashMap, fs::File};
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot};
 
 use crate::proto;
 
@@ -63,15 +64,22 @@ pub type RequestVoteResponder = oneshot::Sender<Result<proto::RequestVoteRespons
 #[derive(Debug)]
 pub enum RaftEvent {
     ElectionTimeout,
+    HeartbeatTick,
+    
     RpcAppendEntries {
         request: proto::AppendEntriesRequest,
         responder: AppendEntriesResponder,
     },
 
-    // Un evento per quando riceviamo un RPC RequestVote.
     RpcRequestVote {
         request: proto::RequestVoteRequest,
         responder: RequestVoteResponder,
+    },
+
+    AppendEntriesResponse {
+        follower_id: String,
+        response: Result<proto::AppendEntriesResponse, Status>,
+        last_log_index_sent: u64,
     },
 }
 
