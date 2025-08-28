@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
-use tonic::client;
-use std::fs::File;
+use std::{collections::HashMap, fs::File};
+use tokio::sync::oneshot;
+
+use crate::proto;
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq)]
 pub enum RaftRole {
@@ -24,11 +26,21 @@ pub struct LogEntry {
     pub command: String,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReplicaProgress {
+    /// Next log index the leader will try to send to this follower.
+    pub next_index: u64,
+    /// Highest log index known to be replicated on this follower.
+    pub match_index: u64,
+}
+
+
 #[derive(Debug, Default,Clone)]
 pub struct RaftVolatileState {
     pub role: RaftRole,
     pub commit_index: u64,
     pub last_applied: u64,
+    pub replicas: HashMap<String, ReplicaProgress>,
 }
 
 #[derive(Debug,Clone)]
@@ -45,8 +57,21 @@ impl RaftNode {
     }
 }
 
+pub type AppendEntriesResponder = oneshot::Sender<Result<proto::AppendEntriesResponse, tonic::Status>>;
+pub type RequestVoteResponder = oneshot::Sender<Result<proto::RequestVoteResponse, tonic::Status>>;
+
 #[derive(Debug)]
 pub enum RaftEvent {
     ElectionTimeout,
+    RpcAppendEntries {
+        request: proto::AppendEntriesRequest,
+        responder: AppendEntriesResponder,
+    },
+
+    // Un evento per quando riceviamo un RPC RequestVote.
+    RpcRequestVote {
+        request: proto::RequestVoteRequest,
+        responder: RequestVoteResponder,
+    },
 }
 
