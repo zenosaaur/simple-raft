@@ -10,14 +10,14 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-const HEARTBEAT_INTERVAL_MS: u64 = 50;
+const HEARTBEAT_INTERVAL_MS: u64 = 500;
 
 pub async fn run_election_timer(
     mut reset_rx: mpsc::Receiver<()>,
     event_tx: mpsc::Sender<RaftEvent>,
 ) {
     loop {
-        let timeout_ms = rand::thread_rng().gen_range(150..=300);
+        let timeout_ms = rand::rng().random_range(1500..=3000);
         let sleep_future = sleep(Duration::from_millis(timeout_ms));
         tokio::pin!(sleep_future);
 
@@ -70,7 +70,6 @@ pub async fn run_raft_node(
                 RaftEvent::ElectionTimeout => {
                     let request = {
                         let mut node = node_arc.lock().await;
-                        // Only Followers and Candidates can start an election.
                         if node.volatile.role != RaftRole::Follower
                             && node.volatile.role != RaftRole::Candidate
                         {
@@ -195,7 +194,6 @@ pub async fn run_raft_node(
                         );
                         node.volatile.role = RaftRole::Leader;
 
-                        // Initialize replica progress tracking
                         node.volatile.replicas.clear();
                         let last_index = node.persistent.log.len() as u64;
                         for follower in &available_followers {
@@ -261,7 +259,6 @@ pub async fn run_raft_node(
                         node.volatile.role = RaftRole::Follower;
                     }
 
-                    // Also step down if we are a candidate in the same term
                     if node.volatile.role == RaftRole::Candidate {
                         println!(
                             "[State] Received AppendEntries as a Candidate. Acknowledging leader and becoming Follower."
@@ -452,8 +449,6 @@ pub async fn run_raft_node(
                 }
 
                 RaftEvent::HeartbeatTick => {
-                    // First, get a clone of the replica progress map and check if we are still the leader.
-                    // This initial lock is very short.
                     let (replicas_clone, is_leader) = {
                         let node = node_arc.lock().await;
                         (
@@ -462,33 +457,24 @@ pub async fn run_raft_node(
                         )
                     };
 
-                    // If we are no longer the leader, just stop. The timer will be aborted by other events.
                     if !is_leader {
                         continue;
                     }
 
                     println!("[Heartbeat] Tick! Sending AppendEntries to followers.");
 
-                    // Iterate over the cloned replica progress to avoid holding the lock.
                     for (follower_id, progress) in replicas_clone {
-                        // For each follower, spawn a dedicated task to handle the RPC.
-                        // Clone the Arcs needed for the task.
                         let node_arc_clone = Arc::clone(&node_arc);
                         let event_tx_clone = event_tx.clone();
 
                         tokio::spawn(async move {
-                            // --- STEP 1: Prepare the request while holding the lock briefly ---
-                            // We re-acquire the lock here to get the most up-to-date state.
                             let (request, last_log_index_sent) = {
                                 let node = node_arc_clone.lock().await;
 
-                                // It's possible our role changed between the outer check and this lock.
-                                // If we're not the leader anymore, abort this specific task.
                                 if node.volatile.role != RaftRole::Leader {
                                     return;
                                 }
 
-                                // Determine the log entry right before the ones we're about to send.
                                 let prev_log_index = progress.next_index - 1;
                                 let prev_log_term = if prev_log_index > 0 {
                                     node.persistent
@@ -496,28 +482,23 @@ pub async fn run_raft_node(
                                         .get((prev_log_index - 1) as usize)
                                         .map_or(0, |e| e.term)
                                 } else {
-                                    0 // This is the case for an empty log.
+                                    0
                                 };
 
-                                // Determine the actual entries to send. For a pure heartbeat, this will be empty.
-                                // For log replication, this will contain new entries.
                                 let start_index = (progress.next_index - 1) as usize;
 
-                                // Efficiently clone ONLY the necessary slice of the log.
                                 let entries_to_send: Vec<proto::LogEntry> = node
                                     .persistent
                                     .log
                                     .get(start_index..)
                                     .unwrap_or(&[])
                                     .iter()
-                                    // We need to convert from our internal LogEntry to the gRPC proto version.
                                     .map(|e| proto::LogEntry {
                                         term: e.term,
                                         command: e.command.clone(),
                                     })
                                     .collect();
 
-                                // This is the index of the last entry we are trying to send in this request.
                                 let last_log_index_sent =
                                     prev_log_index + entries_to_send.len() as u64;
 
@@ -531,9 +512,8 @@ pub async fn run_raft_node(
                                 };
 
                                 (request, last_log_index_sent)
-                            }; // <-- The lock on `node` is released here!
+                            };
 
-                            // --- STEP 2: Perform Network I/O *after* releasing the lock ---
                             let response = match RaftClient::connect(follower_id.clone()).await {
                                 Ok(mut client) => client
                                     .append_entries(request)
@@ -545,7 +525,6 @@ pub async fn run_raft_node(
                                 ))),
                             };
 
-                            // --- STEP 3: Send the result back to the main event loop ---
                             let response_event = RaftEvent::AppendEntriesResponse {
                                 follower_id,
                                 response,
@@ -560,48 +539,40 @@ pub async fn run_raft_node(
                         });
                     }
                 }
+                
                 RaftEvent::AppendEntriesResponse {
                     follower_id,
                     response,
                     last_log_index_sent,
                 } => {
                     let mut node = node_arc.lock().await;
-                    // Ignore responses if we are no longer the leader. This can happen with delayed messages.
                     if node.volatile.role != RaftRole::Leader {
                         continue;
                     }
 
                     match response {
                         Ok(resp) => {
-                            // Rule for all servers: If RPC response contains term T > currentTerm,
-                            // convert to follower.
                             if resp.term > node.persistent.current_term {
                                 println!(
                                     "[State] Follower {} has higher term {}. Stepping down.",
                                     follower_id, resp.term
                                 );
-                                // The stop_heartbeat function would need to be defined elsewhere in the loop
-                                // to abort the timer task's JoinHandle. For this snippet, we'll assume it exists.
-                                // stop_heartbeat(&mut heartbeat_handle);
                                 node.persistent.current_term = resp.term;
                                 node.volatile.role = RaftRole::Follower;
                                 node.persistent.voted_for = None;
 
-                                // Persist the updated term and voted_for status.
                                 if let Err(e) = node.persist() {
                                     eprintln!(
                                         "[State] CRITICAL: Failed to persist state after stepping down: {}",
                                         e
                                     );
                                 }
-                                continue; // Continue the main loop to process the next event.
+                                continue;
                             }
 
-                            // Now, handle the response for the current term.
                             if let Some(progress) = node.volatile.replicas.get_mut(&follower_id) {
                                 if resp.success {
-                                    // --- Success Case ---
-                                    // The follower's log is now consistent with the leader's up to last_log_index_sent.
+
                                     progress.match_index = last_log_index_sent;
                                     progress.next_index = progress.match_index + 1;
 
@@ -610,9 +581,6 @@ pub async fn run_raft_node(
                                         follower_id, progress.match_index
                                     );
 
-                                    // --- Attempt to advance commit index ---
-                                    // A leader can only commit entries from its own term.
-                                    // We check if a majority of nodes have replicated an entry.
 
                                     let mut match_indices: Vec<u64> = node
                                         .volatile
@@ -621,17 +589,12 @@ pub async fn run_raft_node(
                                         .map(|p| p.match_index)
                                         .collect();
 
-                                    // Include the leader itself in the count.
                                     match_indices.push(node.persistent.log.len() as u64);
-
-                                    // Sort from highest to lowest.
                                     match_indices.sort_unstable_by(|a, b| b.cmp(a));
 
-                                    // The index replicated by the majority is the median.
                                     let majority_index = (available_followers.len() + 1) / 2;
                                     let potential_commit_index = match_indices[majority_index];
 
-                                    // Only advance commit_index if the new index is from the current term.
                                     if potential_commit_index > node.volatile.commit_index {
                                         if let Some(entry) = node
                                             .persistent
@@ -645,15 +608,10 @@ pub async fn run_raft_node(
                                                     potential_commit_index
                                                 );
                                                 node.volatile.commit_index = potential_commit_index;
-                                                // In a full implementation, you would now apply committed entries
-                                                // to the state machine.
                                             }
                                         }
                                     }
                                 } else {
-                                    // --- Failure Case ---
-                                    // The follower rejected the AppendEntries, likely due to a log mismatch.
-                                    // Decrement next_index and retry on the next heartbeat.
                                     if progress.next_index > 1 {
                                         progress.next_index -= 1;
                                     }
@@ -665,13 +623,8 @@ pub async fn run_raft_node(
                             }
                         }
                         Err(rpc_error) => {
-                            // --- RPC Error Case ---
-                            // This indicates a network failure or that the follower is down.
-                            // We treat it like a failure and retry.
                             if let Some(progress) = node.volatile.replicas.get_mut(&follower_id) {
                                 if progress.next_index > 1 {
-                                    // It's common to decrement on network failure, but more advanced strategies exist.
-                                    // For simplicity, we'll decrement to force a check on the next attempt.
                                     progress.next_index -= 1;
                                 }
                             }
@@ -682,6 +635,8 @@ pub async fn run_raft_node(
                         }
                     }
                 }
+
+                RaftEvent::ClientRequest { command, responder }
             }
         }
     }

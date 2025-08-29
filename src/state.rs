@@ -60,6 +60,7 @@ impl RaftNode {
 
 pub type AppendEntriesResponder = oneshot::Sender<Result<proto::AppendEntriesResponse, tonic::Status>>;
 pub type RequestVoteResponder = oneshot::Sender<Result<proto::RequestVoteResponse, tonic::Status>>;
+pub type ClientResponder = oneshot::Sender<Result<proto::SubmitCommandResponse, tonic::Status>>;
 
 #[derive(Debug)]
 pub enum RaftEvent {
@@ -80,6 +81,11 @@ pub enum RaftEvent {
         follower_id: String,
         response: Result<proto::AppendEntriesResponse, Status>,
         last_log_index_sent: u64,
+    },
+
+    ClientRequest {
+        command: proto::Command,
+        responder: ClientResponder,
     },
 }
 
