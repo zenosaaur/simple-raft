@@ -1,9 +1,11 @@
+use core::panic;
 use proto::raft_server::{Raft, RaftServer};
+use state::{AppConfig, Peer};
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tonic::transport::Server;
 use uuid::Uuid;
 
@@ -18,16 +20,25 @@ mod state;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // --- 1. Configuration and Argument Parsing ---
     let args: Vec<_> = env::args().collect();
-    if args.len() < 2 { // Indices start at 0, the argument is at index 1
-        panic!("The host port is a required argument. Example: `cargo run 50051`");
+    if args.len() < 2 {
+        panic!("Make sure you have passed a correct number of parameter");
     }
-    let port = &args[1];
-    let own_addr_str = format!("http://0.0.0.0:{}", port);
-    let addr = format!("0.0.0.0:{}", port).parse()?;
 
-    // --- 2. State Initialization (from file or new) ---
+    // node config
+    let config: AppConfig;
+    if std::path::Path::new(&args[1]).exists() {
+        println!("[Main] Condiguration file found. Loadding... ");
+        {
+            let file = File::open(&args[1])?;
+            let reader = BufReader::new(file);
+            config = serde_yaml::from_reader(reader)?
+        }
+    } else {
+        panic!("[Main] You need to add a correct config file");
+    }
+
+    // Node state handler
     let node_state: RaftNode;
     if std::path::Path::new("state.json").exists() {
         println!("[Main] State file found! Loading...");
@@ -52,25 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         node_state.persist()?;
     }
-
     let shared_node_state = Arc::new(Mutex::new(node_state));
-    
+
     let (event_tx, event_rx) = mpsc::channel::<RaftEvent>(100);
     let (reset_timer_tx, reset_timer_rx) = mpsc::channel::<()>(10);
 
-    // Improvement: More robust peer handling
-    let peers_str = "http://0.0.0.0:8080,http://0.0.0.0:8081,http://0.0.0.0:8082";
-    let available_followers: Vec<String> = if peers_str.is_empty() {
-        Vec::new()
-    } else {
-        peers_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|addr| *addr != own_addr_str)
-            .collect()
-    };
+    let available_followers: Vec<Peer> = config.peers;
     println!("[Main] Configured peers: {:?}", available_followers);
-
 
     // --- 4. Spawning Background Tasks ---
     let timer_event_tx = event_tx.clone();
@@ -80,9 +79,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[Main] Election timer task started.");
 
     let raft_node_arc = shared_node_state.clone();
-    let event_tx_clone = event_tx.clone(); 
+    let event_tx_clone = event_tx.clone();
     tokio::spawn(async move {
-        run_raft_node(raft_node_arc, event_rx, reset_timer_tx, event_tx_clone, available_followers).await;
+        run_raft_node(
+            raft_node_arc,
+            event_rx,
+            reset_timer_tx,
+            event_tx_clone,
+            available_followers,
+        ).await;
     });
     println!("[Main] Raft state machine task started.");
 
@@ -90,16 +95,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reflection_service = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build()?;
-        
+
     let raft_service = RaftService {
         event_tx: event_tx.clone(),
     };
 
-    println!("[Main] Raft Server listening on {}", addr);
+    let address = format!("{}:{}", config.host, config.port).parse()?;
+    println!("[Main] Raft Server listening on {}", address);
     Server::builder()
         .add_service(reflection_service)
         .add_service(RaftServer::new(raft_service))
-        .serve(addr)
+        .serve(address)
         .await?;
 
     Ok(())

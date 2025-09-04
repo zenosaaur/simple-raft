@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use tonic::Status;
 use std::{collections::HashMap, fs::File};
-use tokio::{sync::oneshot};
+use tokio::sync::oneshot;
+use tonic::Status;
 
 use crate::proto;
 
@@ -11,6 +11,19 @@ pub enum RaftRole {
     #[default]
     Candidate,
     Leader,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct Peer {
+    pub id: String,
+    pub address: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AppConfig {
+    pub host: String,
+    pub port: u16,
+    pub peers: Vec<Peer>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default, Clone)]
@@ -35,8 +48,7 @@ pub struct ReplicaProgress {
     pub match_index: u64,
 }
 
-
-#[derive(Debug, Default,Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct RaftVolatileState {
     pub role: RaftRole,
     pub commit_index: u64,
@@ -44,7 +56,7 @@ pub struct RaftVolatileState {
     pub replicas: HashMap<String, ReplicaProgress>,
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct RaftNode {
     pub persistent: RaftPersistentState,
     pub volatile: RaftVolatileState,
@@ -66,7 +78,7 @@ pub type ClientResponder = oneshot::Sender<Result<proto::SubmitCommandResponse, 
 pub enum RaftEvent {
     ElectionTimeout,
     HeartbeatTick,
-    
+
     RpcAppendEntries {
         request: proto::AppendEntriesRequest,
         responder: AppendEntriesResponder,
@@ -84,7 +96,7 @@ pub enum RaftEvent {
     },
 
     ClientRequest {
-        command: proto::Command,
+        command: proto::SubmitCommandRequest,
         responder: ClientResponder,
     },
 }

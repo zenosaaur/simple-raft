@@ -15,7 +15,7 @@ impl Raft for RaftService {
         request: tonic::Request<proto::AppendEntriesRequest>,
     ) -> Result<tonic::Response<proto::AppendEntriesResponse>, tonic::Status> {
         let (response_tx, response_rx) = oneshot::channel();
-        let event = RaftEvent::RpcAppendEntries {
+        let event: RaftEvent = RaftEvent::RpcAppendEntries {
             request: request.into_inner(),
             responder: response_tx,
         };

@@ -1,6 +1,6 @@
 use crate::proto;
 use crate::proto::raft_client::RaftClient;
-use crate::state::{LogEntry, RaftEvent, RaftNode, RaftRole, ReplicaProgress};
+use crate::state::{LogEntry, Peer, RaftEvent, RaftNode, RaftRole, ReplicaProgress};
 use futures::{future, stream::StreamExt};
 use rand::Rng;
 use std::sync::Arc;
@@ -60,169 +60,19 @@ pub async fn run_raft_node(
     mut event_rx: mpsc::Receiver<RaftEvent>,
     reset_timer_tx: mpsc::Sender<()>,
     event_tx: mpsc::Sender<RaftEvent>,
-    available_followers: Vec<String>,
+    available_followers: Vec<Peer>,
 ) {
     let mut heartbeat_handle: Option<JoinHandle<()>> = None;
     loop {
         if let Some(event) = event_rx.recv().await {
             println!("[State] Received event: {:?}", event);
             match event {
-                RaftEvent::ElectionTimeout => {
-                    let request = {
-                        let mut node = node_arc.lock().await;
-                        if node.volatile.role != RaftRole::Follower
-                            && node.volatile.role != RaftRole::Candidate
-                        {
-                            println!(
-                                "[State] Ignoring election timeout as we are a {:?}",
-                                node.volatile.role
-                            );
-                            continue;
-                        }
-
-                        // --- Start new election ---
-                        node.volatile.role = RaftRole::Candidate;
-                        node.persistent.current_term += 1;
-                        node.persistent.voted_for = Some(node.persistent.id.clone());
-                        println!(
-                            "[State] Election timeout: Starting new election for term {}.",
-                            node.persistent.current_term
-                        );
-
-                        if let Err(e) = node.persist() {
-                            eprintln!(
-                                "[State] CRITICAL: Failed to persist state during election start: {}",
-                                e
-                            );
-                        }
-
-                        proto::RequestVoteRequest {
-                            term: node.persistent.current_term,
-                            candidate_id: node.persistent.id.clone(),
-                            last_log_term: node.persistent.log.last().map_or(0, |entry| entry.term),
-                            last_log_index: node.persistent.log.len() as u64,
-                        }
-                    };
-                    let connection_futures =
-                        available_followers
-                            .clone()
-                            .into_iter()
-                            .map(|follower_addr| {
-                                let addr = follower_addr.clone();
-                                async move {
-                                    RaftClient::connect(addr.clone())
-                                        .await
-                                        .map_err(|e| (addr, e))
-                                }
-                            });
-
-                    let connection_results: Vec<Result<RaftClient<_>, _>> =
-                        futures::stream::iter(connection_futures)
-                            .buffer_unordered(available_followers.len())
-                            .collect()
-                            .await;
-
-                    let tasks = connection_results
-                        .into_iter()
-                        .filter_map(|result| match result {
-                            Ok(mut client) => {
-                                let req = tonic::Request::new(request.clone());
-                                Some(tokio::spawn(async move { client.request_vote(req).await }))
-                            }
-                            Err((addr, err)) => {
-                                eprintln!(
-                                    "[State] Failed to connect to follower {} to request vote: {}",
-                                    addr, err
-                                );
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-
-                    let results = future::join_all(tasks).await;
-                    let mut votes_received = 1;
-                    for result in results {
-                        match result {
-                            Ok(Ok(response)) => {
-                                let vote = response.get_ref();
-                                println!(
-                                    "[State] Vote response received: term={}, granted={}",
-                                    vote.term, vote.vote_granted
-                                );
-                                let mut node = node_arc.lock().await;
-
-                                if vote.term > node.persistent.current_term {
-                                    println!(
-                                        "[State] Discovered higher term {} (our term is {}). Reverting to Follower.",
-                                        vote.term, node.persistent.current_term
-                                    );
-                                    node.persistent.current_term = vote.term;
-                                    node.volatile.role = RaftRole::Follower;
-                                    node.persistent.voted_for = None;
-                                    if let Err(e) = node.persist() {
-                                        eprintln!(
-                                            "[State] CRITICAL: Failed to persist state after discovering new term: {}",
-                                            e
-                                        );
-                                    }
-                                    break;
-                                }
-
-                                if vote.vote_granted {
-                                    votes_received += 1;
-                                }
-                            }
-                            Ok(Err(rpc_error)) => {
-                                eprintln!("[State] RPC failed during vote request: {}", rpc_error);
-                            }
-                            Err(join_error) => {
-                                eprintln!(
-                                    "[State] Task failed to execute during vote collection: {}",
-                                    join_error
-                                );
-                            }
-                        }
-                    }
-
-                    let mut node = node_arc.lock().await;
-                    if node.volatile.role == RaftRole::Candidate
-                        && votes_received > (available_followers.len() + 1) / 2
-                    {
-                        println!(
-                            "[State] Election WIN! Became LEADER for term {} with {} votes.",
-                            node.persistent.current_term, votes_received
-                        );
-                        node.volatile.role = RaftRole::Leader;
-
-                        node.volatile.replicas.clear();
-                        let last_index = node.persistent.log.len() as u64;
-                        for follower in &available_followers {
-                            node.volatile.replicas.insert(
-                                follower.clone(),
-                                ReplicaProgress {
-                                    next_index: last_index + 1,
-                                    match_index: 0,
-                                },
-                            );
-                        }
-
-                        let leader_event_tx = event_tx.clone();
-                        let handle = tokio::spawn(async move {
-                            run_heartbeat_timer(leader_event_tx).await;
-                        });
-
-                        heartbeat_handle = Some(handle);
-
-                        if let Err(e) = event_tx.send(RaftEvent::HeartbeatTick).await {
-                            eprintln!("[State] Failed to send initial heartbeat event: {}", e);
-                        }
-                    } else if node.volatile.role == RaftRole::Candidate {
-                        println!(
-                            "[State] Election lost for term {}. Received {} votes. Waiting for next timeout.",
-                            node.persistent.current_term, votes_received
-                        );
-                    }
-                }
+                RaftEvent::ElectionTimeout => handle_election_timeout(
+                    node_arc.clone(),
+                    &available_followers,
+                    event_tx.clone(),
+                    &mut heartbeat_handle,
+                ).await,
 
                 RaftEvent::RpcAppendEntries { request, responder } => {
                     let mut node = node_arc.lock().await;
@@ -514,7 +364,12 @@ pub async fn run_raft_node(
                                 (request, last_log_index_sent)
                             };
 
-                            let response = match RaftClient::connect(follower_id.clone()).await {
+                            let response = match RaftClient::connect(format!(
+                                "http://{}",
+                                follower_id.clone()
+                            ))
+                            .await
+                            {
                                 Ok(mut client) => client
                                     .append_entries(request)
                                     .await
@@ -539,7 +394,7 @@ pub async fn run_raft_node(
                         });
                     }
                 }
-                
+
                 RaftEvent::AppendEntriesResponse {
                     follower_id,
                     response,
@@ -572,7 +427,6 @@ pub async fn run_raft_node(
 
                             if let Some(progress) = node.volatile.replicas.get_mut(&follower_id) {
                                 if resp.success {
-
                                     progress.match_index = last_log_index_sent;
                                     progress.next_index = progress.match_index + 1;
 
@@ -580,7 +434,6 @@ pub async fn run_raft_node(
                                         "[State] Follower {} replicated successfully. New match_index: {}",
                                         follower_id, progress.match_index
                                     );
-
 
                                     let mut match_indices: Vec<u64> = node
                                         .volatile
@@ -636,8 +489,167 @@ pub async fn run_raft_node(
                     }
                 }
 
-                RaftEvent::ClientRequest { command, responder }
+                RaftEvent::ClientRequest { command, responder } => {
+                    todo!()
+                }
             }
         }
+    }
+}
+
+async fn handle_election_timeout(
+    node_arc: Arc<Mutex<RaftNode>>,
+    available_followers: &[Peer],
+    event_tx: mpsc::Sender<RaftEvent>,
+    heartbeat_handle: &mut Option<JoinHandle<()>>,
+) {
+    let request = {
+        let mut node = node_arc.lock().await;
+        if node.volatile.role != RaftRole::Follower && node.volatile.role != RaftRole::Candidate {
+            println!(
+                "[State] Ignoring election timeout as we are a {:?}",
+                node.volatile.role
+            );
+            return;
+        }
+
+        // --- Start new election ---
+        node.volatile.role = RaftRole::Candidate;
+        node.persistent.current_term += 1;
+        node.persistent.voted_for = Some(node.persistent.id.clone());
+        println!(
+            "[State] Election timeout: Starting new election for term {}.",
+            node.persistent.current_term
+        );
+
+        if let Err(e) = node.persist() {
+            eprintln!(
+                "[State] CRITICAL: Failed to persist state during election start: {}",
+                e
+            );
+        }
+
+        proto::RequestVoteRequest {
+            term: node.persistent.current_term,
+            candidate_id: node.persistent.id.clone(),
+            last_log_term: node.persistent.log.last().map_or(0, |entry| entry.term),
+            last_log_index: node.persistent.log.len() as u64,
+        }
+    };
+    let connection_futures = available_followers.into_iter().map(|follower_addr| {
+        let addr = format!("http://{}", follower_addr.clone().address);
+        async move {
+            RaftClient::connect(addr.clone())
+                .await
+                .map_err(|e| (addr, e))
+        }
+    });
+    println!("{:?}", connection_futures);
+
+    let connection_results: Vec<Result<RaftClient<_>, _>> =
+        futures::stream::iter(connection_futures)
+            .buffer_unordered(available_followers.len())
+            .collect()
+            .await;
+
+    let tasks = connection_results
+        .into_iter()
+        .filter_map(|result| match result {
+            Ok(mut client) => {
+                let req = tonic::Request::new(request.clone());
+                Some(tokio::spawn(async move { client.request_vote(req).await }))
+            }
+            Err((addr, err)) => {
+                eprintln!(
+                    "[State] Failed to connect to follower {} to request vote: {}",
+                    addr, err
+                );
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let results = future::join_all(tasks).await;
+    let mut votes_received = 1;
+    for result in results {
+        match result {
+            Ok(Ok(response)) => {
+                let vote = response.get_ref();
+                println!(
+                    "[State] Vote response received: term={}, granted={}",
+                    vote.term, vote.vote_granted
+                );
+                let mut node = node_arc.lock().await;
+
+                if vote.term > node.persistent.current_term {
+                    println!(
+                        "[State] Discovered higher term {} (our term is {}). Reverting to Follower.",
+                        vote.term, node.persistent.current_term
+                    );
+                    node.persistent.current_term = vote.term;
+                    node.volatile.role = RaftRole::Follower;
+                    node.persistent.voted_for = None;
+                    if let Err(e) = node.persist() {
+                        eprintln!(
+                            "[State] CRITICAL: Failed to persist state after discovering new term: {}",
+                            e
+                        );
+                    }
+                    break;
+                }
+
+                if vote.vote_granted {
+                    votes_received += 1;
+                }
+            }
+            Ok(Err(rpc_error)) => {
+                eprintln!("[State] RPC failed during vote request: {}", rpc_error);
+            }
+            Err(join_error) => {
+                eprintln!(
+                    "[State] Task failed to execute during vote collection: {}",
+                    join_error
+                );
+            }
+        }
+    }
+
+    let mut node = node_arc.lock().await;
+    if node.volatile.role == RaftRole::Candidate
+        && votes_received > (available_followers.len() + 1) / 2
+    {
+        println!(
+            "[State] Election WIN! Became LEADER for term {} with {} votes.",
+            node.persistent.current_term, votes_received
+        );
+        node.volatile.role = RaftRole::Leader;
+
+        node.volatile.replicas.clear();
+        let last_index = node.persistent.log.len() as u64;
+        for follower in available_followers {
+            node.volatile.replicas.insert(
+                follower.clone().address,
+                ReplicaProgress {
+                    next_index: last_index + 1,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let leader_event_tx = event_tx.clone();
+        let handle = tokio::spawn(async move {
+            run_heartbeat_timer(leader_event_tx).await;
+        });
+
+        *heartbeat_handle = Some(handle);
+
+        if let Err(e) = event_tx.send(RaftEvent::HeartbeatTick).await {
+            eprintln!("[State] Failed to send initial heartbeat event: {}", e);
+        }
+    } else if node.volatile.role == RaftRole::Candidate {
+        println!(
+            "[State] Election lost for term {}. Received {} votes. Waiting for next timeout.",
+            node.persistent.current_term, votes_received
+        );
     }
 }
