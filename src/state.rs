@@ -95,9 +95,9 @@ pub enum RaftEvent {
         last_log_index_sent: u64,
     },
 
-    ClientRequest {
-        command: proto::SubmitCommandRequest,
-        responder: ClientResponder,
-    },
+    // ClientRequest {
+    //     command: proto::SubmitCommandRequest,
+    //     responder: ClientResponder,
+    // },
 }
 

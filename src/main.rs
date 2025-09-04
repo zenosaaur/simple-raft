@@ -1,6 +1,6 @@
 use core::panic;
 use proto::raft_server::{Raft, RaftServer};
-use state::{AppConfig, Peer};
+use state::{AppConfig};
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
@@ -20,6 +20,13 @@ mod state;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let file_appender = tracing_appender::rolling::daily("logs", "application.log");
+
+    tracing_subscriber::fmt()
+        .with_writer(file_appender)
+        .with_ansi(false)
+        .init();
+    
     let args: Vec<_> = env::args().collect();
     if args.len() < 2 {
         panic!("Make sure you have passed a correct number of parameter");
@@ -68,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, event_rx) = mpsc::channel::<RaftEvent>(100);
     let (reset_timer_tx, reset_timer_rx) = mpsc::channel::<()>(10);
 
-    let available_followers: Vec<Peer> = config.peers;
+    let available_followers= config.peers;
     println!("[Main] Configured peers: {:?}", available_followers);
 
     // --- 4. Spawning Background Tasks ---
@@ -86,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             event_rx,
             reset_timer_tx,
             event_tx_clone,
-            available_followers,
+            available_followers.clone()        
         ).await;
     });
     println!("[Main] Raft state machine task started.");
