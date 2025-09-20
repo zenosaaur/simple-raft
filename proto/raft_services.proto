@@ -5,6 +5,7 @@ package raft;
 service raft {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc SubmitCommand(SubmitCommandRequest) returns (SubmitCommandResponse);
 }
 
 message AppendEntriesRequest {
@@ -23,7 +24,9 @@ message AppendEntriesResponse {
 
 message LogEntry {
   uint64 term = 1;
-  string command = 2;
+  string client_id  = 2;
+  uint64 request_id = 3;
+  string command = 4;
 }
 
 // The request message for the RequestVote RPC.
@@ -45,11 +48,15 @@ message RequestVoteResponse {
 message SubmitCommandRequest {
   string command = 1;
   string client_id = 2;
-  string request_id = 3;
+  uint64 request_id = 3;
 }
 
 message SubmitCommandResponse {
   bool success = 1;
   string leader_hint = 2;
-  bytes value = 3;
+  string result = 3;
+}
+
+message LeaderInfo {
+  string leader_address = 1;
 }
