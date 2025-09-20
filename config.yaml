@@ -1,0 +1,10 @@
+host: "0.0.0.0"
+port: 8080
+log_file: "application_1.log"
+state_file: "state_1.json"
+
+peers:
+  - id: "node-2"
+    address: "0.0.0.0:8081"
+  - id: "node-3"
+    address: "0.0.0.0:8082"

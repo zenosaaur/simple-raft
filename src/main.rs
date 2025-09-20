@@ -1,13 +1,13 @@
 use core::panic;
 use proto::raft_server::{Raft, RaftServer};
 use state::{AppConfig};
+use tracing_subscriber::EnvFilter;
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tonic::transport::Server;
-use uuid::Uuid;
 
 use crate::consensus::{run_election_timer, run_raft_node};
 use crate::server::RaftService;
@@ -17,16 +17,11 @@ mod consensus;
 mod proto;
 mod server;
 mod state;
+mod hash_table;
+mod validator;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let file_appender = tracing_appender::rolling::daily("logs", "application.log");
-
-    tracing_subscriber::fmt()
-        .with_writer(file_appender)
-        .with_ansi(false)
-        .init();
-    
     let args: Vec<_> = env::args().collect();
     if args.len() < 2 {
         panic!("Make sure you have passed a correct number of parameter");
@@ -44,22 +39,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         panic!("[Main] You need to add a correct config file");
     }
+    let file_appender = tracing_appender::rolling::daily("logs", config.log_file);
 
-    // Node state handler
+    tracing_subscriber::fmt()
+        .with_writer(file_appender)
+        .with_ansi(false)
+        .init();
+
+    let address = format!("{}:{}", config.host, config.port);
     let node_state: RaftNode;
-    if std::path::Path::new("state.json").exists() {
+    if std::path::Path::new(config.state_file.as_str()).exists() {
         println!("[Main] State file found! Loading...");
-        let file = File::open("state.json")?;
+        let file = File::open(config.state_file.as_str())?;
         let reader = BufReader::new(file);
         let persistent_state: RaftPersistentState = serde_json::from_reader(reader)?;
         node_state = RaftNode {
             persistent: persistent_state,
             volatile: RaftVolatileState::default(),
+            state_path: config.state_file        
         };
     } else {
         println!("[Main] State file not found. Creating new state...");
         let persistent_state = RaftPersistentState {
-            id: Uuid::new_v4().to_string(),
+            id: address.clone(),
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
@@ -67,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_state = RaftNode {
             persistent: persistent_state,
             volatile: RaftVolatileState::default(),
+            state_path: config.state_file    
         };
         node_state.persist()?;
     }
@@ -107,12 +110,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_tx: event_tx.clone(),
     };
 
-    let address = format!("{}:{}", config.host, config.port).parse()?;
-    println!("[Main] Raft Server listening on {}", address);
+    let socket_address= address.parse()?;
+    println!("[Main] Raft Server listening on {}", socket_address);
     Server::builder()
         .add_service(reflection_service)
         .add_service(RaftServer::new(raft_service))
-        .serve(address)
+        .serve(socket_address)
         .await?;
 
     Ok(())

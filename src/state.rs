@@ -3,7 +3,7 @@ use std::{collections::HashMap, fs::File};
 use tokio::sync::oneshot;
 use tonic::Status;
 
-use crate::proto;
+use crate::{hash_table::Db, proto};
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq)]
 pub enum RaftRole {
@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub peers: Vec<Peer>,
+    pub log_file: String,
+    pub state_file: String,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default, Clone)]
@@ -37,6 +39,8 @@ pub struct RaftPersistentState {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct LogEntry {
     pub term: u64,
+    pub client_id: String,
+    pub request_id: u64,
     pub command: String,
 }
 
@@ -48,23 +52,27 @@ pub struct ReplicaProgress {
     pub match_index: u64,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default)]
 pub struct RaftVolatileState {
+    pub db: Db,
     pub role: RaftRole,
     pub commit_index: u64,
     pub last_applied: u64,
-    pub replicas: HashMap<String, ReplicaProgress>,
+    pub replicas: HashMap<String, ReplicaProgress>, 
+    pub leader_hint: String,
+    pub pending_requests: HashMap<u64, ClientResponder>,
+    pub idempotency_cache: HashMap<(String, u64), proto::SubmitCommandResponse>,
 }
 
-#[derive(Debug, Clone)]
 pub struct RaftNode {
     pub persistent: RaftPersistentState,
     pub volatile: RaftVolatileState,
+    pub state_path: String
 }
 
 impl RaftNode {
     pub fn persist(&self) -> Result<(), std::io::Error> {
-        let file = File::create("state.json")?;
+        let file = File::create(self.state_path.as_str())?;
         serde_json::to_writer_pretty(file, &self.persistent)?;
         Ok(())
     }
@@ -94,10 +102,8 @@ pub enum RaftEvent {
         response: Result<proto::AppendEntriesResponse, Status>,
         last_log_index_sent: u64,
     },
-
-    // ClientRequest {
-    //     command: proto::SubmitCommandRequest,
-    //     responder: ClientResponder,
-    // },
+    ClientRequest {
+        command: proto::SubmitCommandRequest,
+        responder: ClientResponder,
+    },
 }
-
