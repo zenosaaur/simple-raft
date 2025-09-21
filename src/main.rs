@@ -1,7 +1,6 @@
 use core::panic;
 use proto::raft_server::{Raft, RaftServer};
-use state::{AppConfig};
-use tracing_subscriber::EnvFilter;
+use state::AppConfig;
 use std::env;
 use std::fs::File;
 use std::io::BufReader;
@@ -14,10 +13,10 @@ use crate::server::RaftService;
 use crate::state::{RaftEvent, RaftNode, RaftPersistentState, RaftVolatileState};
 
 mod consensus;
+mod hash_table;
 mod proto;
 mod server;
 mod state;
-mod hash_table;
 mod validator;
 
 #[tokio::main]
@@ -56,12 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_state = RaftNode {
             persistent: persistent_state,
             volatile: RaftVolatileState::default(),
-            state_path: config.state_file        
+            state_path: config.state_file,
         };
     } else {
         println!("[Main] State file not found. Creating new state...");
         let persistent_state = RaftPersistentState {
-            id: address.clone(),
+            id: format!("{}:{}", config.domain, config.port),
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
@@ -69,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_state = RaftNode {
             persistent: persistent_state,
             volatile: RaftVolatileState::default(),
-            state_path: config.state_file    
+            state_path: config.state_file,
         };
         node_state.persist()?;
     }
@@ -78,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (event_tx, event_rx) = mpsc::channel::<RaftEvent>(100);
     let (reset_timer_tx, reset_timer_rx) = mpsc::channel::<()>(10);
 
-    let available_followers= config.peers;
+    let available_followers = config.peers;
     println!("[Main] Configured peers: {:?}", available_followers);
 
     // --- 4. Spawning Background Tasks ---
@@ -96,8 +95,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             event_rx,
             reset_timer_tx,
             event_tx_clone,
-            available_followers.clone()        
-        ).await;
+            available_followers.clone(),
+        )
+        .await;
     });
     println!("[Main] Raft state machine task started.");
 
@@ -110,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_tx: event_tx.clone(),
     };
 
-    let socket_address= address.parse()?;
+    let socket_address = address.parse()?;
     println!("[Main] Raft Server listening on {}", socket_address);
     Server::builder()
         .add_service(reflection_service)

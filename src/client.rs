@@ -1,4 +1,4 @@
-use prost::{Message};
+use prost::Message;
 use proto::raft_client::RaftClient;
 use std::error::Error;
 use std::{env, io};
@@ -68,7 +68,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     Ok(leader_info) => {
                                         let nuovo_leader_addr = leader_info.leader_address;
                                         url = nuovo_leader_addr.clone();
-                                        client = RaftClient::connect(format!("http://{}",url.clone())).await?;
+                                        println!("{}", url);
+                                        client =
+                                            RaftClient::connect(format!("http://{}", url.clone()))
+                                                .await?;
                                     }
                                     Err(e) => {
                                         println!(

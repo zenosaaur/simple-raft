@@ -22,6 +22,7 @@ pub struct Peer {
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub host: String,
+    pub domain: String,
     pub port: u16,
     pub peers: Vec<Peer>,
     pub log_file: String,
@@ -58,7 +59,7 @@ pub struct RaftVolatileState {
     pub role: RaftRole,
     pub commit_index: u64,
     pub last_applied: u64,
-    pub replicas: HashMap<String, ReplicaProgress>, 
+    pub replicas: HashMap<String, ReplicaProgress>,
     pub leader_hint: String,
     pub pending_requests: HashMap<u64, ClientResponder>,
     pub idempotency_cache: HashMap<(String, u64), proto::SubmitCommandResponse>,
@@ -67,7 +68,7 @@ pub struct RaftVolatileState {
 pub struct RaftNode {
     pub persistent: RaftPersistentState,
     pub volatile: RaftVolatileState,
-    pub state_path: String
+    pub state_path: String,
 }
 
 impl RaftNode {
@@ -78,7 +79,8 @@ impl RaftNode {
     }
 }
 
-pub type AppendEntriesResponder = oneshot::Sender<Result<proto::AppendEntriesResponse, tonic::Status>>;
+pub type AppendEntriesResponder =
+    oneshot::Sender<Result<proto::AppendEntriesResponse, tonic::Status>>;
 pub type RequestVoteResponder = oneshot::Sender<Result<proto::RequestVoteResponse, tonic::Status>>;
 pub type ClientResponder = oneshot::Sender<Result<proto::SubmitCommandResponse, tonic::Status>>;
 

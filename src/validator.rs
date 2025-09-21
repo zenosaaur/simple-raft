@@ -10,9 +10,15 @@ struct Fsm {
 }
 
 impl Fsm {
-    fn new() -> Self { Self { state: State::NotValid } }
+    fn new() -> Self {
+        Self {
+            state: State::NotValid,
+        }
+    }
 
-    fn goto(&mut self, s: State) { self.state = s; }
+    fn goto(&mut self, s: State) {
+        self.state = s;
+    }
 
     fn step(&mut self, command: &str) {
         match self.state {
@@ -24,11 +30,11 @@ impl Fsm {
                 }
             }
             State::PartialValid => {
-                    if command.contains(':') {
-                        self.goto(State::Valid);
-                    } else {
-                        self.goto(State::NotValid);
-                    }
+                if command.contains(':') {
+                    self.goto(State::Valid);
+                } else {
+                    self.goto(State::NotValid);
+                }
             }
             State::Valid => { /* stay valid or add more rules */ }
         }
@@ -41,7 +47,7 @@ pub fn validate(command: &str) -> bool {
         for part in command.split(' ') {
             fsm.step(part);
         }
-    } else{
+    } else {
         fsm.step("exit");
     }
 

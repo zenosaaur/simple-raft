@@ -1,7 +1,6 @@
 use tokio::sync::{mpsc, oneshot};
-use tonic::Status;
 
-use crate::state::{RaftEvent};
+use crate::state::RaftEvent;
 use crate::{Raft, proto};
 
 #[derive(Debug)]
@@ -59,7 +58,8 @@ impl Raft for RaftService {
             )),
         }
     }
-    async fn submit_command(&self,
+    async fn submit_command(
+        &self,
         request: tonic::Request<proto::SubmitCommandRequest>,
     ) -> Result<tonic::Response<proto::SubmitCommandResponse>, tonic::Status> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -68,14 +68,14 @@ impl Raft for RaftService {
             responder: response_tx,
         };
 
-          if self.event_tx.send(event).await.is_err() {
+        if self.event_tx.send(event).await.is_err() {
             return Err(tonic::Status::internal("Event loop is not running"));
         }
 
         match response_rx.await {
             Ok(raft_logic_result) => match raft_logic_result {
                 Ok(response_payload) => Ok(tonic::Response::new(response_payload)),
-                Err(status) => Err(status)
+                Err(status) => Err(status),
             },
             Err(_) => Err(tonic::Status::internal(
                 "Failed to receive response from event loop",

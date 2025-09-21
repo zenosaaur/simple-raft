@@ -7,10 +7,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     tonic_build::configure()
         .file_descriptor_set_path(out_dir.join("raft_descriptor.bin"))
-        .compile(
-            &["proto/raft_services.proto"],
-            &["proto"],
-        )?;
+        .compile(&["proto/raft_services.proto"], &["proto"])?;
 
     Ok(())
 }

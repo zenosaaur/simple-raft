@@ -82,7 +82,9 @@ impl Db {
 
     pub fn set(&mut self, args: &[&str]) -> Result<String, String> {
         if args.len() != 4 {
-            return Err("Format error. Expected: SET <table> <pk_value> <column> <value>".to_string());
+            return Err(
+                "Format error. Expected: SET <table> <pk_value> <column> <value>".to_string(),
+            );
         }
 
         let table = Table::from_str(args[0]).map_err(|_| "Invalid table name".to_string())?;
@@ -94,7 +96,9 @@ impl Db {
 
         let table_data = self.tables.entry(table).or_insert_with(HashMap::new);
 
-        let row = table_data.entry(pk_value.clone()).or_insert_with(HashMap::new);
+        let row = table_data
+            .entry(pk_value.clone())
+            .or_insert_with(HashMap::new);
 
         if column == pk_column {
             row.insert(pk_column, pk_value.clone());
@@ -103,7 +107,10 @@ impl Db {
         // Insert/update the column's value
         row.insert(column.clone(), value.clone());
 
-        Ok(format!("OK. Set {:?} to '{}' for row '{}'", column, value, pk_value))
+        Ok(format!(
+            "OK. Set {:?} to '{}' for row '{}'",
+            column, value, pk_value
+        ))
     }
 
     pub fn get(&self, args: &[&str]) -> Result<String, String> {
@@ -113,13 +120,19 @@ impl Db {
 
         let table = Table::from_str(args[0]).map_err(|_| "Invalid table name".to_string())?;
         let pk_value = args[1];
-        let column_to_get = Column::from_str(args[2]).map_err(|_| "Invalid column name".to_string())?;
+        let column_to_get =
+            Column::from_str(args[2]).map_err(|_| "Invalid column name".to_string())?;
 
         self.tables
             .get(&table)
             .and_then(|table_data| table_data.get(pk_value))
             .and_then(|row| row.get(&column_to_get))
             .map(|value| value.clone())
-            .ok_or_else(|| format!("No value found for key '{}' in table '{:?}'", pk_value, table))
+            .ok_or_else(|| {
+                format!(
+                    "No value found for key '{}' in table '{:?}'",
+                    pk_value, table
+                )
+            })
     }
 }

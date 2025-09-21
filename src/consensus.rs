@@ -1,11 +1,13 @@
 use crate::proto::raft_client::RaftClient;
-use crate::proto::{self, AppendEntriesRequest, AppendEntriesResponse, LeaderInfo, RequestVoteRequest};
+use crate::proto::{
+    self, AppendEntriesRequest, AppendEntriesResponse, LeaderInfo, RequestVoteRequest,
+};
 use crate::state::{
     AppendEntriesResponder, ClientResponder, LogEntry, Peer, RaftEvent, RaftNode, RaftRole,
     ReplicaProgress, RequestVoteResponder,
 };
-use prost::Message;
 use futures::{future, stream::StreamExt};
+use prost::Message;
 use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
@@ -123,13 +125,13 @@ pub async fn run_raft_node(
                 }
 
                 RaftEvent::ClientRequest { command, responder } => {
-                    handle_client_request(node_arc.clone(), command, responder, event_tx.clone()).await;
+                    handle_client_request(node_arc.clone(), command, responder, event_tx.clone())
+                        .await;
                 }
             }
         }
     }
 }
-
 
 #[tracing::instrument(skip_all, fields(term = tracing::field::Empty, votes = tracing::field::Empty))]
 async fn handle_election_timeout(
@@ -824,7 +826,7 @@ async fn handle_client_request(
     node_arc: Arc<Mutex<RaftNode>>,
     command: proto::SubmitCommandRequest,
     responder: ClientResponder,
-    event_tx: mpsc::Sender<RaftEvent>
+    event_tx: mpsc::Sender<RaftEvent>,
 ) {
     {
         let mut node = node_arc.lock().await;
@@ -863,23 +865,26 @@ async fn handle_client_request(
 
         node.persistent.log.push(new_entry);
         let new_entry_index = node.persistent.log.len() as u64;
-        node.volatile.pending_requests.insert(new_entry_index, responder);
+        node.volatile
+            .pending_requests
+            .insert(new_entry_index, responder);
 
         tracing::info!(
             index = new_entry_index,
             "[Client] Nuova richiesta. Aggiunta al log in attesa di commit."
         );
 
-            // Persisti il nuovo stato del log
+        // Persisti il nuovo stato del log
         if let Err(e) = node.persist() {
             tracing::error!(error = %e, "[Client] CRITICO: Fallimento nel persistere il nuovo log.");
             if let Some(responder) = node.volatile.pending_requests.remove(&new_entry_index) {
-                let status = tonic::Status::internal(format!("Fallimento nel persistere il log: {}", e));
+                let status =
+                    tonic::Status::internal(format!("Fallimento nel persistere il log: {}", e));
                 let _ = responder.send(Err(status));
             }
             return;
         }
-    } 
+    }
 
     // --- 5. Attiva immediatamente la replica ---
     if event_tx.send(RaftEvent::HeartbeatTick).await.is_err() {
@@ -892,7 +897,7 @@ fn apply_committed_entries(node: &mut RaftNode) {
 
     for i in (node.volatile.last_applied + 1)..=commit_index {
         let log_index_usize = (i - 1) as usize;
-        
+
         if let Some(entry) = node.persistent.log.get(log_index_usize) {
             let result = match node.volatile.db.parse_command(entry.command.clone()) {
                 Ok(res) => res,
@@ -907,12 +912,17 @@ fn apply_committed_entries(node: &mut RaftNode) {
                     leader_hint: node.persistent.id.clone(),
                     result: result,
                 };
-                
+
                 let request_key = (entry.client_id.clone(), entry.request_id);
-                node.volatile.idempotency_cache.insert(request_key, response.clone());
+                node.volatile
+                    .idempotency_cache
+                    .insert(request_key, response.clone());
 
                 if responder.send(Ok(response)).is_err() {
-                    tracing::info!(index = i, "Fallito invio risposta al client. Canale probabilmente chiuso.");
+                    tracing::info!(
+                        index = i,
+                        "Fallito invio risposta al client. Canale probabilmente chiuso."
+                    );
                 }
             }
         }
