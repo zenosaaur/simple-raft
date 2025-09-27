@@ -7,11 +7,11 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tonic::transport::Server;
 
 use crate::consensus::{
-    run_election_timer, run_raft_node, ConnectionManager, FollowerBackoff, RaftConfig,
+    ConnectionManager, FollowerBackoff, RaftConfig, run_election_timer, run_raft_node,
 };
 use crate::server::RaftService;
 
@@ -86,7 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     peers.retain(|p| p.address != self_id);
     let available_followers = Arc::new(peers);
-    println!("[Main] Configured peers (excluding self): {:?}", available_followers);
+    println!(
+        "[Main] Configured peers (excluding self): {:?}",
+        available_followers
+    );
 
     // --- 4) Consensus runtime wiring ---
     let cfg = RaftConfig::default(); // opzionale: puoi popolare da AppConfig se vuoi renderlo configurabile
@@ -131,7 +134,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
         .build()?;
 
-    let raft_service = RaftService { event_tx: event_tx.clone() };
+    let raft_service = RaftService {
+        event_tx: event_tx.clone(),
+    };
 
     let socket_address = address.parse()?;
     println!("[Main] Raft Server listening on {}", socket_address);

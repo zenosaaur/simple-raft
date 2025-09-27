@@ -5,13 +5,17 @@ use std::{env, fs, io};
 use tonic::{Code, transport::Channel};
 
 use crate::proto::LeaderInfo;
-pub mod proto { tonic::include_proto!("raft"); }
+pub mod proto {
+    tonic::include_proto!("raft");
+}
 
 mod validator;
 
 // --- Simple durable monotonic counter (per client) ---
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
-struct ClientState { last_request_id: u64 }
+struct ClientState {
+    last_request_id: u64,
+}
 
 fn load_state(path: &str) -> ClientState {
     match fs::read(path) {
@@ -27,8 +31,11 @@ fn save_state(path: &str, st: &ClientState) {
 }
 
 fn normalize_url(input: &str) -> String {
-    if input.starts_with("http://") || input.starts_with("https://") { input.to_string() }
-    else { format!("http://{}", input) }
+    if input.starts_with("http://") || input.starts_with("https://") {
+        input.to_string()
+    } else {
+        format!("http://{}", input)
+    }
 }
 
 async fn connect(url: &str) -> Result<RaftClient<Channel>, Box<dyn Error>> {
@@ -67,13 +74,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
             print!("> ");
             io::Write::flush(&mut io::stdout()).expect("flush failed!");
             input.clear();
-            io::stdin().read_line(&mut input).expect("Failed to read line");
+            io::stdin()
+                .read_line(&mut input)
+                .expect("Failed to read line");
         }
         redirected = false;
 
         let trimmed_input = input.trim();
-        if trimmed_input == "exit" { break; }
-        if trimmed_input.is_empty() { continue; }
+        if trimmed_input == "exit" {
+            break;
+        }
+        if trimmed_input.is_empty() {
+            continue;
+        }
 
         // Monotonic per-client request id
         let request_id = state.last_request_id.wrapping_add(1);
