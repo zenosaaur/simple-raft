@@ -14,6 +14,7 @@ use crate::state::{RaftEvent, RaftNode, RaftPersistentState, RaftVolatileState};
 
 mod consensus;
 mod hash_table;
+mod parser;
 mod proto;
 mod server;
 mod state;
