@@ -9,7 +9,7 @@ pub mod proto {
     tonic::include_proto!("raft");
 }
 
-mod validator;
+mod parser;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             break;
         }
 
-        if !validator::validate(trimmed_input) {
+        if let Ok(parsed_command) = parser::parse_commands(trimmed_input) {
             let command_request = proto::SubmitCommandRequest {
                 client_id: "desktop-client-01".to_string(),
                 request_id: request_id_counter,

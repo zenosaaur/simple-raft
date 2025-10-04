@@ -24,7 +24,7 @@ fn command_value<'i>(input: &mut &'i str) -> winnow::Result<Vec<&'i str>> {
     Ok(words)
 }
 
-fn parse_commands(
+pub fn parse_commands(
     input: &str,
 ) -> Result<Vec<Vec<&str>>, winnow::error::ParseError<&str, winnow::error::ContextError>> {
     delimited(
