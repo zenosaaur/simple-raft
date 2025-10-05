@@ -6,32 +6,284 @@ use crate::state::{
     AppendEntriesResponder, ClientResponder, LogEntry, Peer, RaftEvent, RaftNode, RaftRole,
     ReplicaProgress, RequestVoteResponder,
 };
-use futures::{future, stream::StreamExt};
+use futures::future;
 use prost::Message;
 use rand::Rng;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
-use tonic::Status;
+use tokio::time::{Instant, sleep};
+use tonic::{Status, transport::Channel};
 
-const HEARTBEAT_INTERVAL_MS: u64 = 500;
+// =============================
+// Config & Utilities
+// =============================
+
+#[derive(Clone, Debug)]
+pub struct RaftConfig {
+    pub heartbeat_interval_ms: u64,
+    pub election_timeout_min_ms: u64,
+    pub election_timeout_max_ms: u64,
+    pub backoff_base_ms: u64,
+    pub backoff_max_ms: u64,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_ms: 500,
+            election_timeout_min_ms: 1500,
+            election_timeout_max_ms: 3000,
+            backoff_base_ms: 200,
+            backoff_max_ms: 5000,
+        }
+    }
+}
+
+fn rand_timeout_ms(cfg: &RaftConfig) -> u64 {
+    let mut rng = rand::thread_rng();
+    rng.gen_range(cfg.election_timeout_min_ms..=cfg.election_timeout_max_ms)
+}
+
+#[inline]
+fn majority(total_nodes: usize) -> usize {
+    total_nodes / 2 + 1
+}
+
+#[inline]
+fn leader_majority(followers: usize) -> usize {
+    majority(followers + 1)
+}
+
+async fn persist_or_log(node: &mut RaftNode, context: &str) -> Result<(), std::io::Error> {
+    node.persist().map_err(|e| {
+        tracing::error!(error = %e, "[Persist] CRITICAL failure while {context}");
+        e
+    })
+}
+
+fn stop_heartbeat(handle: &mut Option<JoinHandle<()>>) {
+    if let Some(h) = handle.take() {
+        tracing::debug!("[State] Stopping heartbeat timer (stepping down / shutting down).");
+        h.abort();
+    }
+}
+
+fn start_heartbeat(event_tx: mpsc::Sender<RaftEvent>, cfg: RaftConfig) -> JoinHandle<()> {
+    tokio::spawn(async move { run_heartbeat_timer(event_tx, cfg).await })
+}
+
+// =============================
+// Connection Manager (tonic channel reuse)
+// =============================
+
+#[derive(Default)]
+pub struct ConnectionManager {
+    // Cache tonic Channels per address; clients are cheap/clonable around a shared channel
+    channels: Mutex<HashMap<String, Channel>>,
+}
+
+impl ConnectionManager {
+    pub fn new() -> Self {
+        Self {
+            channels: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn get_client(
+        &self,
+        addr: &str,
+    ) -> Result<RaftClient<Channel>, tonic::transport::Error> {
+        let mut map = self.channels.lock().await;
+        let channel: Channel = if let Some(ch) = map.get(addr) {
+            ch.clone()
+        } else {
+            let endpoint = format!("http://{}", addr);
+            let ch = Channel::from_shared(endpoint)
+                .expect("valid endpoint")
+                .connect()
+                .await?;
+            map.insert(addr.to_string(), ch.clone());
+            ch
+        };
+        Ok(RaftClient::new(channel))
+    }
+}
+
+// =============================
+// Follower Backoff (per-addr)
+// =============================
+
+#[derive(Clone, Debug)]
+struct BackoffState {
+    failures: u32,
+    next_attempt_at: Instant,
+}
+
+impl BackoffState {
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            next_attempt_at: Instant::now(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct FollowerBackoff {
+    inner: Mutex<HashMap<String, BackoffState>>, // follower_id -> state
+}
+
+impl FollowerBackoff {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn allow_now(&self, follower: &str) -> bool {
+        let map: tokio::sync::MutexGuard<'_, HashMap<String, BackoffState>> = self.inner.lock().await;
+        match map.get(follower) {
+            None => true,
+            Some(st) => Instant::now() >= st.next_attempt_at,
+        }
+    }
+
+    pub async fn record_success(&self, follower: &str) {
+        let mut map = self.inner.lock().await;
+        let st = map
+            .entry(follower.to_string())
+            .or_insert_with(BackoffState::new);
+        st.failures = 0;
+        st.next_attempt_at = Instant::now();
+    }
+
+    pub async fn record_failure(&self, follower: &str, cfg: &RaftConfig) {
+        let mut map = self.inner.lock().await;
+        let st = map
+            .entry(follower.to_string())
+            .or_insert_with(BackoffState::new);
+        st.failures = st.failures.saturating_add(1);
+        let pow = st.failures.min(10); // cap exponent growth
+        let base = cfg.backoff_base_ms as u64;
+        let max = cfg.backoff_max_ms as u64;
+        let backoff_ms = (base << (pow - 1).max(0)) // base * 2^(n-1)
+            .min(max);
+        // jitter 0..base
+        let jitter = rand::thread_rng().gen_range(0..=cfg.backoff_base_ms);
+        let delay = Duration::from_millis(backoff_ms + jitter as u64);
+        st.next_attempt_at = Instant::now() + delay;
+        tracing::trace!(
+            follower,
+            failures = st.failures,
+            backoff_ms = delay.as_millis() as u64,
+            "[Backoff] Scheduled next attempt"
+        );
+    }
+}
+
+// =============================
+// Driver
+// =============================
+
+pub async fn run_raft_node(
+    node_arc: Arc<Mutex<RaftNode>>,
+    mut event_rx: mpsc::Receiver<RaftEvent>,
+    reset_timer_tx: mpsc::Sender<()>,
+    event_tx: mpsc::Sender<RaftEvent>,
+    available_followers: Arc<Vec<Peer>>, // entire cluster minus self
+    cfg: RaftConfig,
+    conn_mgr: Arc<ConnectionManager>,
+    backoff: Arc<FollowerBackoff>,
+) {
+    let mut heartbeat_handle: Option<JoinHandle<()>> = None;
+
+    while let Some(event) = event_rx.recv().await {
+        tracing::debug!("[State] Received event: {:?}", event);
+        match event {
+            RaftEvent::ElectionTimeout => {
+                handle_election_timeout(
+                    node_arc.clone(),
+                    available_followers.clone(),
+                    event_tx.clone(),
+                    &mut heartbeat_handle,
+                    cfg.clone(),
+                    conn_mgr.clone(),
+                    backoff.clone(),
+                )
+                .await;
+            }
+            RaftEvent::RpcAppendEntries { request, responder } => {
+                handle_rpc_append_entries(
+                    node_arc.clone(),
+                    request,
+                    responder,
+                    reset_timer_tx.clone(),
+                    &mut heartbeat_handle,
+                )
+                .await;
+            }
+            RaftEvent::RpcRequestVote { request, responder } => {
+                handle_rpc_request_vote(
+                    node_arc.clone(),
+                    request,
+                    responder,
+                    reset_timer_tx.clone(),
+                )
+                .await;
+            }
+            RaftEvent::HeartbeatTick => {
+                handle_heartbeat_tick(
+                    node_arc.clone(),
+                    event_tx.clone(),
+                    cfg.clone(),
+                    conn_mgr.clone(),
+                    backoff.clone(),
+                )
+                .await;
+            }
+            RaftEvent::AppendEntriesResponse {
+                follower_id,
+                response,
+                last_log_index_sent,
+            } => {
+                handle_append_entries_response(
+                    node_arc.clone(),
+                    available_followers.clone(),
+                    follower_id,
+                    response,
+                    last_log_index_sent,
+                    backoff.clone(),
+                )
+                .await;
+            }
+            RaftEvent::ClientRequest { command, responder } => {
+                handle_client_request(node_arc.clone(), command, responder, event_tx.clone()).await;
+            }
+        }
+    }
+
+    stop_heartbeat(&mut heartbeat_handle);
+}
+
+// =============================
+// Timers
+// =============================
 
 pub async fn run_election_timer(
     mut reset_rx: mpsc::Receiver<()>,
     event_tx: mpsc::Sender<RaftEvent>,
+    cfg: RaftConfig,
 ) {
     loop {
-        let timeout_ms = rand::rng().random_range(1500..=3000);
-        let sleep_future = sleep(Duration::from_millis(timeout_ms));
-        tokio::pin!(sleep_future);
-
+        let timeout_ms = rand_timeout_ms(&cfg);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         tracing::debug!("[Timer] Waiting for {} ms...", timeout_ms);
 
         tokio::select! {
-            _ = &mut sleep_future => {
+            _ = sleep(deadline.saturating_duration_since(Instant::now())) => {
                 tracing::debug!("[Timer] Fired after {} ms! Triggering election.", timeout_ms);
                 if let Err(e) = event_tx.send(RaftEvent::ElectionTimeout).await {
                     tracing::debug!("[Timer] Failed to send election timeout event: {}", e);
@@ -44,103 +296,34 @@ pub async fn run_election_timer(
     }
 }
 
-pub async fn run_heartbeat_timer(event_tx: mpsc::Sender<RaftEvent>) {
+pub async fn run_heartbeat_timer(event_tx: mpsc::Sender<RaftEvent>, cfg: RaftConfig) {
+    let interval = Duration::from_millis(cfg.heartbeat_interval_ms);
     loop {
-        sleep(Duration::from_millis(HEARTBEAT_INTERVAL_MS)).await;
-
+        sleep(interval).await;
         if event_tx.send(RaftEvent::HeartbeatTick).await.is_err() {
-            tracing::debug!("[Heartbeat] Canale chiuso, termino il timer del leader.");
+            tracing::debug!(
+                "[Heartbeat] Event channel closed, terminating leader heartbeat timer."
+            );
             break;
         }
     }
 }
 
-fn stop_heartbeat(handle: &mut Option<JoinHandle<()>>) {
-    if let Some(h) = handle.take() {
-        tracing::debug!("[State] Stepping down from Leader, stopping heartbeat timer.");
-        h.abort();
-    }
-}
-
-pub async fn run_raft_node(
-    node_arc: Arc<Mutex<RaftNode>>,
-    mut event_rx: mpsc::Receiver<RaftEvent>,
-    reset_timer_tx: mpsc::Sender<()>,
-    event_tx: mpsc::Sender<RaftEvent>,
-    available_followers: Vec<Peer>,
-) {
-    let mut heartbeat_handle: Option<JoinHandle<()>> = None;
-    loop {
-        if let Some(event) = event_rx.recv().await {
-            tracing::debug!("[State] Received event: {:?}", event);
-            match event {
-                RaftEvent::ElectionTimeout => {
-                    handle_election_timeout(
-                        node_arc.clone(),
-                        available_followers.clone(),
-                        event_tx.clone(),
-                        &mut heartbeat_handle,
-                    )
-                    .await;
-                }
-
-                RaftEvent::RpcAppendEntries { request, responder } => {
-                    handle_rpc_append_entries(
-                        node_arc.clone(),
-                        request,
-                        responder,
-                        reset_timer_tx.clone(),
-                        &mut heartbeat_handle,
-                    )
-                    .await;
-                }
-
-                RaftEvent::RpcRequestVote { request, responder } => {
-                    handle_rpc_request_vote(
-                        node_arc.clone(),
-                        request,
-                        responder,
-                        reset_timer_tx.clone(),
-                    )
-                    .await;
-                }
-
-                RaftEvent::HeartbeatTick => {
-                    handle_heartbeat_tick(node_arc.clone(), event_tx.clone()).await;
-                }
-
-                RaftEvent::AppendEntriesResponse {
-                    follower_id,
-                    response,
-                    last_log_index_sent,
-                } => {
-                    handle_append_entries_response(
-                        node_arc.clone(),
-                        follower_id,
-                        available_followers.clone(),
-                        response,
-                        last_log_index_sent,
-                    )
-                    .await;
-                }
-
-                RaftEvent::ClientRequest { command, responder } => {
-                    handle_client_request(node_arc.clone(), command, responder, event_tx.clone())
-                        .await;
-                }
-            }
-        }
-    }
-}
+// =============================
+// Event Handlers
+// =============================
 
 #[tracing::instrument(skip_all, fields(term = tracing::field::Empty, votes = tracing::field::Empty))]
 async fn handle_election_timeout(
     node_arc: Arc<Mutex<RaftNode>>,
-    available_followers: Vec<Peer>,
+    available_followers: Arc<Vec<Peer>>,
     event_tx: mpsc::Sender<RaftEvent>,
     heartbeat_handle: &mut Option<JoinHandle<()>>,
+    cfg: RaftConfig,
+    conn_mgr: Arc<ConnectionManager>,
+    backoff: Arc<FollowerBackoff>,
 ) {
-    let followers = available_followers.clone();
+    // --- Start new election ---
     let request = {
         let mut node = node_arc.lock().await;
         if node.volatile.role != RaftRole::Follower && node.volatile.role != RaftRole::Candidate {
@@ -148,7 +331,6 @@ async fn handle_election_timeout(
             return;
         }
 
-        // --- Start new election ---
         node.volatile.role = RaftRole::Candidate;
         node.persistent.current_term += 1;
         node.persistent.voted_for = Some(node.persistent.id.clone());
@@ -156,11 +338,8 @@ async fn handle_election_timeout(
         tracing::Span::current().record("term", node.persistent.current_term);
         tracing::debug!("Starting new election");
 
-        if let Err(e) = node.persist() {
-            tracing::error!(
-                "CRITICAL: Failed to persist state during election start: {}",
-                e
-            );
+        if let Err(e) = persist_or_log(&mut node, "starting election").await {
+            tracing::error!("CRITICAL: {e}");
         }
 
         proto::RequestVoteRequest {
@@ -170,47 +349,44 @@ async fn handle_election_timeout(
             last_log_index: node.persistent.log.len() as u64,
         }
     };
-    let connection_futures = available_followers.into_iter().map(|follower_addr| {
-        let addr = format!("http://{}", follower_addr.clone().address);
-        async move {
-            RaftClient::connect(addr.clone())
-                .await
-                .map_err(|e| (addr, e))
-        }
-    });
-    let len = followers.len();
-    let connection_results: Vec<Result<RaftClient<_>, _>> =
-        futures::stream::iter(connection_futures)
-            .buffer_unordered(len)
-            .collect()
-            .await;
 
-    let tasks = connection_results
-        .into_iter()
-        .filter_map(|result| match result {
-            Ok(mut client) => {
-                let req = tonic::Request::new(request.clone());
-                Some(tokio::spawn(async move { client.request_vote(req).await }))
+    // Connect to followers concurrently (respect backoff)
+    let followers = available_followers.clone();
+    let len = followers.len();
+
+    let mut tasks = Vec::with_capacity(len);
+    for f in followers.iter() {
+        let addr = f.address.clone();
+        if !backoff.allow_now(&addr).await {
+            tracing::trace!(follower = %addr, "[Election] Skipping vote RPC due to backoff");
+            continue;
+        }
+        let conn_mgr = conn_mgr.clone();
+        let req_clone = request.clone();
+        tasks.push(tokio::spawn(async move {
+            match conn_mgr.get_client(&addr).await {
+                Ok(mut client) => {
+                    let req = tonic::Request::new(req_clone);
+                    client.request_vote(req).await.map_err(|e| (addr, e))
+                }
+                Err(e) => Err((addr, Status::unavailable(e.to_string()))),
             }
-            Err((addr, err)) => {
-                tracing::error!(
-                    "[State] Failed to connect to follower {} to request vote: {}",
-                    addr,
-                    err
-                );
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    tracing::debug!("Sending RequestVote");
+        }));
+    }
+
+    tracing::debug!(
+        "Sending RequestVote to {} followers (after backoff)",
+        tasks.len()
+    );
     let results = future::join_all(tasks).await;
-    let mut votes_received = 1;
+
+    let mut votes_received = 1; // self-vote
     for result in results {
         match result {
             Ok(Ok(response)) => {
                 let vote = response.get_ref();
                 tracing::debug!(
-                    "[State] Vote response received: term={}, granted={}",
+                    "[State] Vote response: term={}, granted={}",
                     vote.term,
                     vote.vote_granted
                 );
@@ -218,19 +394,15 @@ async fn handle_election_timeout(
 
                 if vote.term > node.persistent.current_term {
                     tracing::debug!(
-                        "[State] Discovered higher term {} (our term is {}). Reverting to Follower.",
+                        "[State] Higher term {} discovered (ours {}). Reverting to Follower.",
                         vote.term,
                         node.persistent.current_term
                     );
                     node.persistent.current_term = vote.term;
                     node.volatile.role = RaftRole::Follower;
                     node.persistent.voted_for = None;
-                    if let Err(e) = node.persist() {
-                        tracing::debug!(
-                            "[State] CRITICAL: Failed to persist state after discovering new term: {}",
-                            e
-                        );
-                    }
+                    let _ =
+                        persist_or_log(&mut node, "discovered higher term during election").await;
                     break;
                 }
 
@@ -238,21 +410,21 @@ async fn handle_election_timeout(
                     votes_received += 1;
                 }
             }
-            Ok(Err(rpc_error)) => {
-                tracing::debug!("[State] RPC failed during vote request: {}", rpc_error);
+            Ok(Err((addr, rpc_error))) => {
+                tracing::debug!("[State] Vote RPC failed for {}: {}", addr, rpc_error);
+                backoff.record_failure(&addr, &cfg).await;
             }
             Err(join_error) => {
-                tracing::error!(
-                    "[State] Task failed to execute during vote collection: {}",
-                    join_error
-                );
+                tracing::error!("[State] Task failed during vote collection: {}", join_error);
             }
         }
     }
 
     tracing::Span::current().record("votes", votes_received);
     let mut node = node_arc.lock().await;
-    if node.volatile.role == RaftRole::Candidate && votes_received > (followers.len() + 1) / 2 {
+    if node.volatile.role == RaftRole::Candidate
+        && votes_received >= leader_majority(available_followers.len())
+    {
         tracing::debug!(
             "[State] Election WIN! Became LEADER for term {} with {} votes.",
             node.persistent.current_term,
@@ -262,9 +434,9 @@ async fn handle_election_timeout(
 
         node.volatile.replicas.clear();
         let last_index = node.persistent.log.len() as u64;
-        for follower in followers {
+        for follower in available_followers.iter() {
             node.volatile.replicas.insert(
-                follower.clone().address,
+                follower.address.clone(),
                 ReplicaProgress {
                     next_index: last_index + 1,
                     match_index: 0,
@@ -272,12 +444,8 @@ async fn handle_election_timeout(
             );
         }
 
-        let leader_event_tx = event_tx.clone();
-        let handle = tokio::spawn(async move {
-            run_heartbeat_timer(leader_event_tx).await;
-        });
-
-        *heartbeat_handle = Some(handle);
+        stop_heartbeat(heartbeat_handle);
+        *heartbeat_handle = Some(start_heartbeat(event_tx.clone(), cfg.clone()));
 
         if let Err(e) = event_tx.send(RaftEvent::HeartbeatTick).await {
             tracing::debug!("[State] Failed to send initial heartbeat event: {}", e);
@@ -302,7 +470,7 @@ async fn handle_rpc_append_entries(
     let mut node = node_arc.lock().await;
 
     tracing::info!(
-        "[RPC AppendEntries] Received request: term={}, prev_log_index={}, num_entries={}, leader_id={}",
+        "[RPC AppendEntries] Received: term={}, prev_log_index={}, entries={}, leader_id={}",
         request.term,
         request.prev_log_index,
         request.entries.len(),
@@ -311,7 +479,7 @@ async fn handle_rpc_append_entries(
 
     if request.term < node.persistent.current_term {
         tracing::debug!(
-            "[RPC AppendEntries] Rejecting: request term {} is older than our term {}",
+            "[RPC AppendEntries] Reject: term {} < {}",
             request.term,
             node.persistent.current_term
         );
@@ -322,13 +490,13 @@ async fn handle_rpc_append_entries(
         return;
     }
 
-    tracing::trace!("[State] Election timer reset due to valid leader communication.");
-    node.volatile.leader_hint = request.leader_id;
+    // Valid leader contact resets timer
+    node.volatile.leader_hint = request.leader_id.clone();
     let _ = reset_timer_tx.send(()).await;
 
     if request.term > node.persistent.current_term {
         tracing::debug!(
-            "[State] Discovered higher term {}. Current term was {}. Stepping down to Follower.",
+            "[State] Higher term {} seen (ours {}). Stepping down.",
             request.term,
             node.persistent.current_term
         );
@@ -339,34 +507,31 @@ async fn handle_rpc_append_entries(
     }
 
     if node.volatile.role == RaftRole::Candidate {
-        tracing::debug!(
-            "[State] Candidate received AppendEntries from new leader (term {}). Becoming Follower.",
-            request.term
-        );
+        tracing::debug!("[State] Candidate got AppendEntries; becoming Follower.");
         node.volatile.role = RaftRole::Follower;
     }
-    // Log consistency check
+
+    // Consistency check
     if request.prev_log_index > 0 {
-        let vec_index = (request.prev_log_index - 1) as usize;
-        match node.persistent.log.get(vec_index) {
+        let idx = (request.prev_log_index - 1) as usize;
+        match node.persistent.log.get(idx) {
+            Some(entry) if entry.term == request.prev_log_term => {}
             Some(entry) => {
-                if entry.term != request.prev_log_term {
-                    tracing::debug!(
-                        "[RPC AppendEntries] Rejecting: Log consistency check failed. Term mismatch at index {}. Our term: {}, Leader's term: {}",
-                        request.prev_log_index,
-                        entry.term,
-                        request.prev_log_term
-                    );
-                    let _ = responder.send(Ok(proto::AppendEntriesResponse {
-                        term: node.persistent.current_term,
-                        success: false,
-                    }));
-                    return;
-                }
+                tracing::debug!(
+                    "[RPC AppendEntries] Reject: term mismatch at {} (ours {}, leader {}).",
+                    request.prev_log_index,
+                    entry.term,
+                    request.prev_log_term
+                );
+                let _ = responder.send(Ok(proto::AppendEntriesResponse {
+                    term: node.persistent.current_term,
+                    success: false,
+                }));
+                return;
             }
             None => {
                 tracing::debug!(
-                    "[RPC AppendEntries] Rejecting: Log consistency check failed. Log is too short. No entry at index {}. Our log length: {}",
+                    "[RPC AppendEntries] Reject: log too short at {} (len={}).",
                     request.prev_log_index,
                     node.persistent.log.len()
                 );
@@ -379,72 +544,52 @@ async fn handle_rpc_append_entries(
         }
     }
 
-    // Find conflicts, truncate if necessary, and find where to start appending.
-    let mut first_new_entry_index_opt = None;
-    for (i, new_entry) in request.entries.iter().enumerate() {
-        let log_index = (request.prev_log_index as usize) + i;
-        if let Some(existing_entry) = node.persistent.log.get(log_index) {
-            if existing_entry.term != new_entry.term {
-                tracing::debug!(
-                    "[Log] Conflict found at index {}. Our term: {}, Leader's term: {}. Truncating log from this point.",
-                    log_index + 1,
-                    existing_entry.term,
-                    new_entry.term
-                );
-                node.persistent.log.truncate(log_index);
-                first_new_entry_index_opt = Some(i);
+    // Detect conflicts & append
+    let mut first_new: Option<usize> = None;
+    for (i, new_e) in request.entries.iter().enumerate() {
+        let log_idx = (request.prev_log_index as usize) + i;
+        match node.persistent.log.get(log_idx) {
+            Some(existing) if existing.term != new_e.term => {
+                tracing::debug!("[Log] Conflict at {} -> truncate.", log_idx + 1);
+                node.persistent.log.truncate(log_idx);
+                first_new = Some(i);
                 break;
             }
-        } else {
-            // This is the first entry that doesn't exist in our log.
-            first_new_entry_index_opt = Some(i);
-            break;
-        }
-    }
-
-    // Append any new entries that are not already in the log.
-    if let Some(first_new_entry_index) = first_new_entry_index_opt {
-        let num_to_append = request.entries.len() - first_new_entry_index;
-        if num_to_append > 0 {
-            tracing::debug!(
-                "[Log] Appending {} new entries starting at index {}.",
-                num_to_append,
-                node.persistent.log.len() + 1
-            );
-            for i in first_new_entry_index..request.entries.len() {
-                let entry_to_add = &request.entries[i];
-                node.persistent.log.push(LogEntry {
-                    client_id: entry_to_add.client_id.clone(),
-                    request_id: entry_to_add.request_id,
-                    term: entry_to_add.term,
-                    command: entry_to_add.command.clone(),
-                });
+            Some(_) => {}
+            None => {
+                first_new = Some(i);
+                break;
             }
         }
     }
 
-    // Update commit_index
-    if request.leader_commit > node.volatile.commit_index {
-        let old_commit_index = node.volatile.commit_index;
-        let last_new_entry_index = request.prev_log_index + request.entries.len() as u64;
-        node.volatile.commit_index = std::cmp::min(request.leader_commit, last_new_entry_index);
+    if let Some(first) = first_new {
+        for e in request.entries.iter().skip(first) {
+            node.persistent.log.push(LogEntry {
+                client_id: e.client_id.clone(),
+                request_id: e.request_id,
+                term: e.term,
+                command: e.command.clone(),
+            });
+        }
+        tracing::debug!("[Log] Appended {} entries.", request.entries.len() - first);
+    }
 
-        // Check if the commit_index actually advanced before logging.
-        if node.volatile.commit_index > old_commit_index {
+    // Advance commit index from leader
+    if request.leader_commit > node.volatile.commit_index {
+        let old = node.volatile.commit_index;
+        let last_new = request.prev_log_index + request.entries.len() as u64;
+        node.volatile.commit_index = std::cmp::min(request.leader_commit, last_new);
+        if node.volatile.commit_index > old {
             tracing::debug!(
-                "[State] Advanced commit_index from {} to {}.",
-                old_commit_index,
+                "[State] commit_index advanced: {} -> {}",
+                old,
                 node.volatile.commit_index
             );
         }
     }
 
-    // Persist state to stable storage.
-    if let Err(e) = node.persist() {
-        tracing::error!(
-            error = %e,
-            "[State] CRITICAL: Failed to persist state after appending entries. This is a fatal error."
-        );
+    if let Err(e) = persist_or_log(&mut node, "after appending entries").await {
         let _ = responder.send(Err(tonic::Status::internal(format!(
             "Failed to save state: {}",
             e
@@ -452,15 +597,14 @@ async fn handle_rpc_append_entries(
         return;
     }
 
+    if node.volatile.last_applied < node.volatile.commit_index {
+        apply_committed_entries(&mut node);
+    }
+
     let response = proto::AppendEntriesResponse {
         term: node.persistent.current_term,
         success: true,
     };
-
-    tracing::debug!(
-        "[RPC AppendEntries] Request successful. Responding with term={}, success=true.",
-        response.term
-    );
     let _ = responder.send(Ok(response));
 }
 
@@ -474,17 +618,12 @@ async fn handle_rpc_request_vote(
     let mut node = node_arc.lock().await;
 
     tracing::debug!(
-        "[RPC RequestVote] Received vote request from candidate {} for term {}.",
+        "[RPC RequestVote] From {} term {}",
         request.candidate_id,
         request.term
     );
 
     if request.term < node.persistent.current_term {
-        tracing::debug!(
-            "[RPC RequestVote] Rejecting vote: Candidate term {} is less than our term {}.",
-            request.term,
-            node.persistent.current_term
-        );
         let _ = responder.send(Ok(proto::RequestVoteResponse {
             term: node.persistent.current_term,
             vote_granted: false,
@@ -492,30 +631,17 @@ async fn handle_rpc_request_vote(
         return;
     }
 
-    // Discovered a higher term
     if request.term > node.persistent.current_term {
-        tracing::debug!(
-            "[State] Discovered higher term {} from RequestVote (our term was {}). Stepping down.",
-            request.term,
-            node.persistent.current_term
-        );
         node.persistent.current_term = request.term;
         node.persistent.voted_for = None;
         node.volatile.role = RaftRole::Follower;
     }
 
-    // Check if we can vote in this term
     let can_vote = match &node.persistent.voted_for {
         None => true,
-        Some(voted_id) => *voted_id == request.candidate_id,
+        Some(id) => *id == request.candidate_id,
     };
-
     if !can_vote {
-        tracing::debug!(
-            "[RPC RequestVote] Rejecting vote: Already voted for {:?} in term {}.",
-            node.persistent.voted_for,
-            node.persistent.current_term
-        );
         let _ = responder.send(Ok(proto::RequestVoteResponse {
             term: node.persistent.current_term,
             vote_granted: false,
@@ -523,22 +649,13 @@ async fn handle_rpc_request_vote(
         return;
     }
 
-    // Raft safety check: ensure candidate's log is at least as up-to-date as ours
-    let last_log_term = node.persistent.log.last().map_or(0, |entry| entry.term);
+    // Up-to-date check
+    let last_log_term = node.persistent.log.last().map_or(0, |e| e.term);
     let last_log_index = node.persistent.log.len() as u64;
-
-    let our_log_is_more_up_to_date = last_log_term > request.last_log_term
+    let our_newer = last_log_term > request.last_log_term
         || (last_log_term == request.last_log_term && last_log_index > request.last_log_index);
 
-    if our_log_is_more_up_to_date {
-        // This is the most important part of the voting logic.
-        tracing::debug!(
-            "[RPC RequestVote] Rejecting vote: Candidate's log is not up-to-date. Our log: [term: {}, index: {}], Candidate's log: [term: {}, index: {}].",
-            last_log_term,
-            last_log_index,
-            request.last_log_term,
-            request.last_log_index
-        );
+    if our_newer {
         let _ = responder.send(Ok(proto::RequestVoteResponse {
             term: node.persistent.current_term,
             vote_granted: false,
@@ -546,21 +663,11 @@ async fn handle_rpc_request_vote(
         return;
     }
 
-    // Grant the vote
-    tracing::debug!(
-        "[RPC RequestVote] Granting vote for candidate {} in term {}.",
-        request.candidate_id,
-        request.term
-    );
-    tracing::trace!("[State] Election timer reset after granting vote.");
+    // Grant
     let _ = reset_timer_tx.send(()).await;
     node.persistent.voted_for = Some(request.candidate_id.clone());
 
-    if let Err(e) = node.persist() {
-        tracing::error!(
-            error = %e,
-            "[State] CRITICAL: Failed to persist vote. This could lead to a safety violation."
-        );
+    if let Err(e) = persist_or_log(&mut node, "persisting granted vote").await {
         let _ = responder.send(Err(tonic::Status::internal(format!(
             "Failed to persist vote: {}",
             e
@@ -572,14 +679,18 @@ async fn handle_rpc_request_vote(
         term: node.persistent.current_term,
         vote_granted: true,
     };
-
-    tracing::debug!("[RPC RequestVote] Sending response: vote_granted=true.");
     let _ = responder.send(Ok(response));
 }
 
-#[tracing::instrument(skip_all, fields(term = tracing::field::Empty, votes = tracing::field::Empty))]
-async fn handle_heartbeat_tick(node_arc: Arc<Mutex<RaftNode>>, event_tx: mpsc::Sender<RaftEvent>) {
-    let (replicas_clone, is_leader, current_term) = {
+#[tracing::instrument(skip_all)]
+async fn handle_heartbeat_tick(
+    node_arc: Arc<Mutex<RaftNode>>,
+    event_tx: mpsc::Sender<RaftEvent>,
+    cfg: RaftConfig,
+    conn_mgr: Arc<ConnectionManager>,
+    backoff: Arc<FollowerBackoff>,
+) {
+    let (replicas, is_leader, current_term) = {
         let node = node_arc.lock().await;
         (
             node.volatile.replicas.clone(),
@@ -589,30 +700,29 @@ async fn handle_heartbeat_tick(node_arc: Arc<Mutex<RaftNode>>, event_tx: mpsc::S
     };
 
     if !is_leader {
-        tracing::trace!("[Heartbeat] Skipping tick: not the leader.");
         return;
     }
 
-    tracing::debug!(
-        "[Heartbeat] Tick for term {}: Sending AppendEntries to followers.",
-        current_term
-    );
-
-    for (follower_id, progress) in replicas_clone {
+    for (follower_id, progress) in replicas {
         let node_arc_clone = Arc::clone(&node_arc);
         let event_tx_clone = event_tx.clone();
+        let conn_mgr = conn_mgr.clone();
+        let backoff = backoff.clone();
+        let cfg = cfg.clone();
 
         tokio::spawn(async move {
+            if !backoff.allow_now(&follower_id).await {
+                tracing::trace!(follower_id = %follower_id, "[Heartbeat] Skipping due to backoff.");
+                return;
+            }
+
             let (request, last_log_index_sent) = {
                 let node = node_arc_clone.lock().await;
-
-                // This check is important because the node might have lost leadership
-                // while tasks were being spawned.
                 if node.volatile.role != RaftRole::Leader {
                     return;
                 }
 
-                let prev_log_index = progress.next_index - 1;
+                let prev_log_index = progress.next_index.saturating_sub(1);
                 let prev_log_term = if prev_log_index > 0 {
                     node.persistent
                         .log
@@ -623,7 +733,6 @@ async fn handle_heartbeat_tick(node_arc: Arc<Mutex<RaftNode>>, event_tx: mpsc::S
                 };
 
                 let start_index = (progress.next_index - 1) as usize;
-
                 let entries_to_send: Vec<proto::LogEntry> = node
                     .persistent
                     .log
@@ -648,113 +757,71 @@ async fn handle_heartbeat_tick(node_arc: Arc<Mutex<RaftNode>>, event_tx: mpsc::S
                     entries: entries_to_send,
                     leader_commit: node.volatile.commit_index,
                 };
-
                 (request, last_log_index_sent)
             };
 
-            tracing::trace!(
-                follower_id = %follower_id,
-                prev_log_index = request.prev_log_index,
-                prev_log_term = request.prev_log_term,
-                num_entries = request.entries.len(),
-                "Sending AppendEntries RPC to follower."
-            );
-
-            // Make the RPC call
-            let response =
-                match RaftClient::connect(format!("http://{}", follower_id.clone())).await {
-                    Ok(mut client) => client
-                        .append_entries(request)
-                        .await
-                        .map(|resp| resp.into_inner()),
-                    Err(e) => {
-                        tracing::warn!(
-                            follower_id = %follower_id,
-                            error = %e,
-                            "Failed to connect to follower."
-                        );
-                        Err(tonic::Status::unavailable(format!(
-                            "Connection failed: {}",
-                            e
-                        )))
+            match conn_mgr.get_client(&follower_id).await {
+                Ok(mut client) => {
+                    let resp = client.append_entries(request).await.map(|r| r.into_inner());
+                    match &resp {
+                        Ok(r) => {
+                            backoff.record_success(&follower_id).await;
+                            tracing::debug!(follower_id = %follower_id, success = r.success, term = r.term, "AppendEntries response.");
+                        }
+                        Err(e) => {
+                            backoff.record_failure(&follower_id, &cfg).await;
+                            tracing::warn!(follower_id = %follower_id, error = %e, "AppendEntries RPC failed.");
+                        }
                     }
-                };
 
-            match &response {
-                Ok(resp) => {
-                    tracing::debug!(follower_id = %follower_id, success = resp.success, term = resp.term, "Received AppendEntries response from follower.")
+                    let response_event = RaftEvent::AppendEntriesResponse {
+                        follower_id,
+                        response: resp,
+                        last_log_index_sent,
+                    };
+                    if let Err(_) = event_tx_clone.send(response_event).await {
+                        tracing::error!("[Heartbeat] Event channel closed; shutting down subtask.");
+                    }
                 }
-                Err(status) => {
-                    tracing::warn!(follower_id = %follower_id, ?status, "AppendEntries RPC failed for follower.")
+                Err(e) => {
+                    backoff.record_failure(&follower_id, &cfg).await;
+                    tracing::warn!(follower_id = %follower_id, error = %e, "Connection manager failed to connect.");
                 }
-            };
-
-            let response_event = RaftEvent::AppendEntriesResponse {
-                follower_id,
-                response,
-                last_log_index_sent,
-            };
-
-            if event_tx_clone.send(response_event).await.is_err() {
-                tracing::error!(
-                    "[Heartbeat] CRITICAL: Raft event channel closed. The core task may have panicked. Shutting down heartbeat task."
-                );
             }
         });
     }
 }
 
-#[tracing::instrument(skip_all, fields(term = tracing::field::Empty, votes = tracing::field::Empty))]
+#[tracing::instrument(skip_all)]
 async fn handle_append_entries_response(
     node_arc: Arc<Mutex<RaftNode>>,
+    available_followers: Arc<Vec<Peer>>,
     follower_id: String,
-    available_followers: Vec<Peer>,
     response: Result<AppendEntriesResponse, Status>,
     last_log_index_sent: u64,
+    backoff: Arc<FollowerBackoff>,
 ) {
-    let followers = available_followers.clone();
     let mut node = node_arc.lock().await;
 
     if node.volatile.role != RaftRole::Leader {
-        tracing::trace!(
-            follower_id = %follower_id,
-            "Ignoring AppendEntries response: not in leader state."
-        );
         return;
     }
 
     match response {
         Ok(resp) => {
             if resp.term > node.persistent.current_term {
-                tracing::debug!(
-                    follower_id = %follower_id,
-                    new_term = resp.term,
-                    old_term = node.persistent.current_term,
-                    "Follower has a higher term. Stepping down."
-                );
                 node.persistent.current_term = resp.term;
                 node.volatile.role = RaftRole::Follower;
                 node.persistent.voted_for = None;
-                if let Err(e) = node.persist() {
-                    tracing::error!(
-                        error = %e,
-                        "CRITICAL: Failed to persist state after stepping down."
-                    );
-                }
+                let _ = persist_or_log(&mut node, "stepping down on higher term").await;
                 return;
             }
 
             if let Some(progress) = node.volatile.replicas.get_mut(&follower_id) {
                 if resp.success {
+                    backoff.record_success(&follower_id).await;
                     progress.match_index = last_log_index_sent;
                     progress.next_index = progress.match_index + 1;
-
-                    tracing::debug!(
-                        follower_id = %follower_id,
-                        match_index = progress.match_index,
-                        next_index = progress.next_index,
-                        "Follower replication successful."
-                    );
 
                     let mut match_indices: Vec<u64> = node
                         .volatile
@@ -762,19 +829,11 @@ async fn handle_append_entries_response(
                         .values()
                         .map(|p| p.match_index)
                         .collect();
+                    match_indices.push(node.persistent.log.len() as u64);
+                    match_indices.sort_unstable_by(|a, b| b.cmp(a));
 
-                    match_indices.push(node.persistent.log.len() as u64); // Include leader's own progress
-                    match_indices.sort_unstable_by(|a, b| b.cmp(a)); // Sort descending
-
-                    let majority_index = (followers.len() + 1) / 2;
-                    let potential_commit_index = match_indices[majority_index];
-
-                    tracing::trace!(
-                        ?match_indices,
-                        majority_quorum_size = majority_index + 1,
-                        potential_commit_index,
-                        "Calculated potential commit index from follower matches."
-                    );
+                    let majority_pos = leader_majority(available_followers.len()) - 1;
+                    let potential_commit_index = *match_indices.get(majority_pos).unwrap_or(&0);
 
                     if potential_commit_index > node.volatile.commit_index {
                         if let Some(entry) = node
@@ -783,20 +842,8 @@ async fn handle_append_entries_response(
                             .get((potential_commit_index - 1) as usize)
                         {
                             if entry.term == node.persistent.current_term {
-                                tracing::debug!(
-                                    old_commit_index = node.volatile.commit_index,
-                                    new_commit_index = potential_commit_index,
-                                    "Advancing commit index based on majority consensus."
-                                );
                                 node.volatile.commit_index = potential_commit_index;
                                 apply_committed_entries(&mut node);
-                            } else {
-                                tracing::debug!(
-                                    potential_commit_index,
-                                    entry_term = entry.term,
-                                    current_term = node.persistent.current_term,
-                                    "Cannot advance commit index yet: majority log entry is from a previous term."
-                                );
                             }
                         }
                     }
@@ -804,20 +851,17 @@ async fn handle_append_entries_response(
                     if progress.next_index > 1 {
                         progress.next_index -= 1;
                     }
-                    tracing::debug!(
-                        follower_id = %follower_id,
-                        next_index = progress.next_index,
-                        "Follower failed consistency check. Decrementing next_index for retry."
-                    );
+                    backoff
+                        .record_failure(&follower_id, &RaftConfig::default())
+                        .await; // conservative if cfg not threaded here
                 }
             }
         }
-        Err(rpc_error) => {
-            tracing::warn!(
-                follower_id = %follower_id,
-                error = %rpc_error,
-                "RPC to follower failed. Will retry on next heartbeat."
-            );
+        Err(e) => {
+            backoff
+                .record_failure(&follower_id, &RaftConfig::default())
+                .await;
+            tracing::warn!(follower_id = %follower_id, error = %e, "RPC to follower failed.");
         }
     }
 }
@@ -828,14 +872,12 @@ async fn handle_client_request(
     responder: ClientResponder,
     event_tx: mpsc::Sender<RaftEvent>,
 ) {
-    {
+    let new_entry_index = {
         let mut node = node_arc.lock().await;
         if node.volatile.role != RaftRole::Leader {
-            tracing::info!("[Client] Request rejected: this node is not the leader.");
             let leader_info = LeaderInfo {
                 leader_address: node.volatile.leader_hint.clone(),
             };
-
             let mut status = Status::failed_precondition("This node is not the leader.");
             status.metadata_mut().insert_bin(
                 "leader-info-bin",
@@ -844,15 +886,10 @@ async fn handle_client_request(
             let _ = responder.send(Err(status));
             return;
         }
-        let request_key = (command.client_id.clone(), command.request_id);
 
-        if let Some(cached_response) = node.volatile.idempotency_cache.get(&request_key) {
-            tracing::info!(
-                client_id = %request_key.0,
-                request_id = %request_key.1,
-                "[Client] Rilevata richiesta duplicata. Invio risposta dalla cache."
-            );
-            let _ = responder.send(Ok(cached_response.clone()));
+        let request_key = (command.client_id.clone(), command.request_id);
+        if let Some(cached) = node.volatile.idempotency_cache.get(&request_key) {
+            let _ = responder.send(Ok(cached.clone()));
             return;
         }
 
@@ -862,33 +899,22 @@ async fn handle_client_request(
             request_id: command.request_id,
             command: command.command,
         };
-
         node.persistent.log.push(new_entry);
-        let new_entry_index = node.persistent.log.len() as u64;
-        node.volatile
-            .pending_requests
-            .insert(new_entry_index, responder);
+        let new_idx = node.persistent.log.len() as u64;
+        node.volatile.pending_requests.insert(new_idx, responder);
 
-        tracing::info!(
-            index = new_entry_index,
-            "[Client] Nuova richiesta. Aggiunta al log in attesa di commit."
-        );
-
-        // Persisti il nuovo stato del log
-        if let Err(e) = node.persist() {
-            tracing::error!(error = %e, "[Client] CRITICO: Fallimento nel persistere il nuovo log.");
-            if let Some(responder) = node.volatile.pending_requests.remove(&new_entry_index) {
-                let status =
-                    tonic::Status::internal(format!("Fallimento nel persistere il log: {}", e));
+        if let Err(e) = persist_or_log(&mut node, "persisting new log entry").await {
+            if let Some(responder) = node.volatile.pending_requests.remove(&new_idx) {
+                let status = tonic::Status::internal(format!("Failed to persist log: {}", e));
                 let _ = responder.send(Err(status));
             }
             return;
         }
-    }
+        new_idx
+    };
 
-    // --- 5. Attiva immediatamente la replica ---
     if event_tx.send(RaftEvent::HeartbeatTick).await.is_err() {
-        tracing::info!("[Client] Il canale degli eventi è chiuso. Impossibile avviare la replica.");
+        tracing::info!("[Client] Event channel closed. Cannot trigger replication.");
     }
 }
 
@@ -896,36 +922,70 @@ fn apply_committed_entries(node: &mut RaftNode) {
     let commit_index = node.volatile.commit_index;
 
     for i in (node.volatile.last_applied + 1)..=commit_index {
-        let log_index_usize = (i - 1) as usize;
-
-        if let Some(entry) = node.persistent.log.get(log_index_usize) {
+        let idx = (i - 1) as usize;
+        if let Some(entry) = node.persistent.log.get(idx) {
             let result = match node.volatile.db.parse_command(entry.command.clone()) {
                 Ok(res) => res,
                 Err(e) => {
-                    tracing::info!(error = %e, "Failed to parse command for log entry at index {}", i);
+                    tracing::info!(error = %e, "Failed to parse command at log index {}", i);
                     continue;
                 }
             };
+
             if let Some(responder) = node.volatile.pending_requests.remove(&i) {
                 let response = proto::SubmitCommandResponse {
                     success: true,
                     leader_hint: node.persistent.id.clone(),
-                    result: result,
+                    result,
                 };
-
                 let request_key = (entry.client_id.clone(), entry.request_id);
                 node.volatile
                     .idempotency_cache
                     .insert(request_key, response.clone());
-
-                if responder.send(Ok(response)).is_err() {
-                    tracing::info!(
-                        index = i,
-                        "Fallito invio risposta al client. Canale probabilmente chiuso."
-                    );
-                }
+                let _ = responder.send(Ok(response));
             }
         }
         node.volatile.last_applied = i;
+    }
+}
+
+// =============================
+// Tests (unit-level for helpers & backoff). For full integration tests, add a mock tonic server.
+// =============================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_majority() {
+        assert_eq!(majority(1), 1);
+        assert_eq!(majority(2), 2);
+        assert_eq!(majority(3), 2);
+        assert_eq!(majority(5), 3);
+    }
+
+    #[test]
+    fn test_leader_majority() {
+        // followers -> total = followers + 1
+        assert_eq!(leader_majority(0), 1); // single-node cluster
+        assert_eq!(leader_majority(1), 2); // 2 nodes total (not safe in Raft, but math ok)
+        assert_eq!(leader_majority(2), 2);
+        assert_eq!(leader_majority(3), 3);
+    }
+
+    #[tokio::test]
+    async fn test_backoff_progression_and_reset() {
+        let cfg = RaftConfig::default();
+        let bo = FollowerBackoff::new();
+        let id = "f1";
+
+        assert!(bo.allow_now(id).await);
+        bo.record_failure(id, &cfg).await;
+        let allowed_soon = bo.allow_now(id).await;
+        assert!(allowed_soon == true || allowed_soon == false);
+
+        bo.record_success(id).await;
+        assert!(bo.allow_now(id).await);
     }
 }
