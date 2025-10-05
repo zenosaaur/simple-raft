@@ -1,5 +1,6 @@
 host: "0.0.0.0"
 port: 8082
+domain: "localhost"
 log_file: "application_3.log"
 state_file: "state_3.json"
 peers:

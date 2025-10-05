@@ -9,7 +9,7 @@ pub mod proto {
     tonic::include_proto!("raft");
 }
 
-mod validator;
+mod parser;
 
 // --- Simple durable monotonic counter (per client) ---
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
@@ -90,47 +90,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         // Monotonic per-client request id
         let request_id = state.last_request_id.wrapping_add(1);
-
-        let command_request = proto::SubmitCommandRequest {
-            client_id: client_id.clone(),
-            request_id,
-            command: trimmed_input.to_string(),
-        };
-
-        let request = tonic::Request::new(command_request);
-        match client.submit_command(request).await {
-            Ok(res) => {
-                println!("Success: {:?}", res.get_ref().result);
-                state.last_request_id = request_id;
-                save_state(&state_path, &state);
-            }
-            Err(status) => {
-                if status.code() == Code::FailedPrecondition {
-                    if let Some(details_bin) = status.metadata().get_bin("leader-info-bin") {
-                        match details_bin.to_bytes() {
-                            Ok(bytes) => match LeaderInfo::decode(bytes) {
-                                Ok(leader_info) => {
-                                    let leader = leader_info.leader_address;
-                                    let new_url = normalize_url(&leader);
-                                    println!("Redirecting to {}...", new_url);
-                                    url = new_url;
-                                    client = connect(&url).await?;
-                                    redirected = true; // retry same input on next loop
-                                    continue;
-                                }
-                                Err(e) => eprintln!("Failed to decode leader info: {}", e),
-                            },
-                            Err(e) => eprintln!("Invalid binary metadata bytes: {e}"),
+        if let Ok(parsed_command) = parser::parse_commands(trimmed_input) {
+            let command_request = proto::SubmitCommandRequest {
+                client_id: "desktop-client-01".to_string(),
+                request_id,
+                command: trimmed_input.to_string(),
+            };
+            let request = tonic::Request::new(command_request);
+            match client.submit_command(request).await {
+                Ok(res) => {
+                    if res.get_ref().success { 
+                        println!("Success: {:?}", res.get_ref().result);
+                    }
+                    else {
+                        println!("Error: {:?}",res.get_ref().result);
+                    }
+                    state.last_request_id = request_id;
+                    save_state(&state_path, &state);
+                }
+                Err(status) => {
+                    if status.code() == Code::FailedPrecondition {
+                        if let Some(details_bin) = status.metadata().get_bin("leader-info-bin") {
+                            match details_bin.to_bytes() {
+                                Ok(bytes) => match LeaderInfo::decode(bytes) {
+                                    Ok(leader_info) => {
+                                        let leader = leader_info.leader_address;
+                                        let new_url = normalize_url(&leader);
+                                        println!("Redirecting to {}...", new_url);
+                                        url = new_url;
+                                        client = connect(&url).await?;
+                                        redirected = true; // retry same input on next loop
+                                        continue;
+                                    }
+                                    Err(e) => eprintln!("Failed to decode leader info: {}", e),
+                                },
+                                Err(e) => eprintln!("Invalid binary metadata bytes: {e}"),
+                            }
+                        } else {
+                            println!("Leader hint missing; retrying later.");
                         }
                     } else {
-                        println!("Leader hint missing; retrying later.");
+                        eprintln!("RPC error: {}", status);
                     }
-                } else {
-                    eprintln!("RPC error: {}", status);
                 }
             }
         }
     }
-
     Ok(())
 }

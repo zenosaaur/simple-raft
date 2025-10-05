@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use crate::parser;
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
 pub enum Table {
@@ -65,19 +66,18 @@ impl Db {
     }
 
     pub fn parse_command(&mut self, command: String) -> Result<String, String> {
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        if parts.is_empty() {
-            return Err("Command cannot be empty.".to_string());
-        }
+        if let Ok(parts) = parser::parse_commands(&command){ 
+            let cmd = parts[0][0];
+            let args = &parts[0][1..];
 
-        let cmd = parts[0].to_uppercase();
-        let args = &parts[1..];
-
-        match cmd.as_str() {
-            "SET" => self.set(args),
-            "GET" => self.get(args),
-            _ => Err(format!("Unknown command: {}", cmd)),
-        }
+            if cmd == "GET" {
+                return self.get(args)
+            };
+            if cmd == "SET" {
+                return self.set(args)
+            };
+        };
+        return Err("Command cannot be empty.".to_string());
     }
 
     pub fn set(&mut self, args: &[&str]) -> Result<String, String> {

@@ -925,19 +925,27 @@ fn apply_committed_entries(node: &mut RaftNode) {
         let idx = (i - 1) as usize;
         if let Some(entry) = node.persistent.log.get(idx) {
             let result = match node.volatile.db.parse_command(entry.command.clone()) {
-                Ok(res) => res,
+                Ok(res) => Ok(res),
                 Err(e) => {
                     tracing::info!(error = %e, "Failed to parse command at log index {}", i);
-                    continue;
-                }
+                    Err(e.to_string())
+                },
             };
 
             if let Some(responder) = node.volatile.pending_requests.remove(&i) {
-                let response = proto::SubmitCommandResponse {
-                    success: true,
-                    leader_hint: node.persistent.id.clone(),
-                    result,
+                let response = match result {
+                    Ok(res) => proto::SubmitCommandResponse {
+                        success: true,
+                        leader_hint: node.persistent.id.clone(),
+                        result: res,
+                    },
+                    Err(err_msg) => proto::SubmitCommandResponse {
+                        success: false,
+                        leader_hint: node.persistent.id.clone(),
+                        result: err_msg,
+                    },
                 };
+
                 let request_key = (entry.client_id.clone(), entry.request_id);
                 node.volatile
                     .idempotency_cache
@@ -948,6 +956,7 @@ fn apply_committed_entries(node: &mut RaftNode) {
         node.volatile.last_applied = i;
     }
 }
+
 
 // =============================
 // Tests (unit-level for helpers & backoff). For full integration tests, add a mock tonic server.

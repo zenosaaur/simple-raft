@@ -17,6 +17,7 @@ use crate::server::RaftService;
 
 mod consensus;
 mod hash_table;
+mod parser;
 mod proto;
 mod server;
 mod state;
