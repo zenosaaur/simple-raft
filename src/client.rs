@@ -99,7 +99,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let request = tonic::Request::new(command_request);
             match client.submit_command(request).await {
                 Ok(res) => {
-                    println!("Success: {:?}", res.get_ref().result);
+                    if res.get_ref().success { 
+                        println!("Success: {:?}", res.get_ref().result);
+                    }
+                    else {
+                        println!("Error: {:?}",res.get_ref().result);
+                    }
                     state.last_request_id = request_id;
                     save_state(&state_path, &state);
                 }
