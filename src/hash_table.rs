@@ -1,6 +1,6 @@
+use crate::parser;
 use std::collections::HashMap;
 use std::str::FromStr;
-use crate::parser;
 
 #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
 pub enum Table {
@@ -66,16 +66,19 @@ impl Db {
     }
 
     pub fn parse_command(&mut self, command: String) -> Result<String, String> {
-        if let Ok(parts) = parser::parse_commands(&command){ 
+        if let Ok(parts) = parser::parse_commands(&command) {
             let cmd = parts[0][0];
             let args = &parts[0][1..];
 
             if cmd == "GET" {
-                return self.get(args)
+                return self.get(args);
             };
             if cmd == "SET" {
-                return self.set(args)
+                return self.set(args);
             };
+            if cmd == "DELETE" {
+                return self.delete(args);
+            }; 
         };
         return Err("Command cannot be empty.".to_string());
     }
@@ -134,5 +137,35 @@ impl Db {
                     pk_value, table
                 )
             })
+    }
+
+    pub fn delete(&mut self, args: &[&str]) -> Result<String, String> {
+        if args.len() != 3 {
+            return Err("Format error. Expected: DELETE <table> <pk_value> <column>".to_string());
+        };
+
+        let table = Table::from_str(args[0]).map_err(|_| "Invalid table name".to_string())?;
+        let pk_value = args[1];
+        let column_to_delete =
+            Column::from_str(args[2]).map_err(|_| "Invalid column name".to_string())?;
+
+        self.tables
+            .get_mut(&table)
+            .ok_or_else(|| format!("Table '{:?}' not found", table))?
+            .get_mut(pk_value)
+            .ok_or_else(|| format!("Row with key '{}' not found", pk_value))?
+            .remove(&column_to_delete)
+            .ok_or_else(|| {
+                format!(
+                    "Column '{:?}' not found for row '{}'",
+                    column_to_delete, pk_value
+                )
+            })?;
+
+
+        Ok(format!(
+            "OK. Deleted {:?} for row '{}'",
+            column_to_delete, pk_value
+        ))
     }
 }
