@@ -1,5 +1,6 @@
 use core::panic;
 use proto::raft_server::{Raft, RaftServer};
+use hash_table::Db;
 use state::{AppConfig, Peer, RaftEvent, RaftNode, RaftPersistentState, RaftVolatileState};
 
 use std::env;
@@ -50,7 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- 2) Persistent/volatile state bootstrap ---
     let address = format!("{}:{}", config.host, config.port);
-    let node_state: RaftNode = if std::path::Path::new(config.state_file.as_str()).exists() {
+    let snapshot_path = format!("{}.snapshot", config.state_file);
+
+    let mut node_state: RaftNode = if std::path::Path::new(config.state_file.as_str()).exists() {
         println!("[Main] State file found! Loading...");
         let file = File::open(config.state_file.as_str())?;
         let reader = BufReader::new(file);
@@ -59,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             persistent: persistent_state,
             volatile: RaftVolatileState::default(),
             state_path: config.state_file.clone(),
+            snapshot_path: snapshot_path.clone(),
         }
     } else {
         println!("[Main] State file not found. Creating new state...");
@@ -67,15 +71,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
+            log_offset: 0,
         };
         let node = RaftNode {
             persistent: persistent_state,
             volatile: RaftVolatileState::default(),
             state_path: config.state_file.clone(),
+            snapshot_path: snapshot_path.clone(),
         };
         node.persist().await?;
         node
     };
+
+    // Load snapshot if exists and restore state machine
+    if let Ok(Some(snapshot)) = node_state.load_snapshot().await {
+        println!(
+            "[Main] Snapshot found! Restoring state machine (last_index={})...",
+            snapshot.last_included_index
+        );
+        match serde_json::from_slice::<Db>(&snapshot.data) {
+            Ok(db) => {
+                node_state.volatile.db = db;
+                node_state.volatile.last_applied = snapshot.last_included_index;
+                node_state.volatile.commit_index = snapshot.last_included_index;
+                println!("[Main] State machine restored from snapshot.");
+            }
+            Err(e) => {
+                println!("[Main] WARNING: Failed to deserialize snapshot: {}", e);
+            }
+        }
+    }
+
+    // Replay log entries after snapshot to rebuild full state
+    let log_offset = node_state.persistent.log_offset;
+    for (i, entry) in node_state.persistent.log.iter().enumerate() {
+        let index = log_offset + 1 + i as u64;
+        if index > node_state.volatile.last_applied {
+            let _ = node_state.volatile.db.parse_command(entry.command.clone());
+            node_state.volatile.last_applied = index;
+        }
+    }
+    if node_state.persistent.log.len() > 0 {
+        println!(
+            "[Main] Replayed {} log entries (last_applied={})",
+            node_state.persistent.log.len(),
+            node_state.volatile.last_applied
+        );
+    }
+
     let shared_node_state = Arc::new(Mutex::new(node_state));
 
     // --- 3) Cluster peers ---

@@ -82,4 +82,29 @@ impl Raft for RaftService {
             )),
         }
     }
+
+    async fn install_snapshot(
+        &self,
+        request: tonic::Request<proto::InstallSnapshotRequest>,
+    ) -> Result<tonic::Response<proto::InstallSnapshotResponse>, tonic::Status> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let event = RaftEvent::RpcInstallSnapshot {
+            request: request.into_inner(),
+            responder: response_tx,
+        };
+
+        if self.event_tx.send(event).await.is_err() {
+            return Err(tonic::Status::internal("Event loop is not running"));
+        }
+
+        match response_rx.await {
+            Ok(raft_logic_result) => match raft_logic_result {
+                Ok(response_payload) => Ok(tonic::Response::new(response_payload)),
+                Err(status) => Err(status),
+            },
+            Err(_) => Err(tonic::Status::internal(
+                "Failed to receive response from event loop",
+            )),
+        }
+    }
 }

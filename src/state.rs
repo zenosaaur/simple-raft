@@ -39,6 +39,18 @@ pub struct RaftPersistentState {
     pub current_term: u64,
     pub voted_for: Option<String>,
     pub log: Vec<LogEntry>,
+    /// Offset of the first log entry (after log compaction).
+    /// Real index = log_offset + position in log vector.
+    #[serde(default)]
+    pub log_offset: u64,
+}
+
+/// Snapshot of the state machine for log compaction.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Snapshot {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub data: Vec<u8>, // Serialized Db state
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -89,6 +101,7 @@ pub struct RaftNode {
     pub persistent: RaftPersistentState,
     pub volatile: RaftVolatileState,
     pub state_path: String,
+    pub snapshot_path: String,
 }
 
 impl RaftNode {
@@ -97,12 +110,56 @@ impl RaftNode {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         tokio::fs::write(&self.state_path, data).await
     }
+
+    /// Get a log entry by its absolute index (accounting for log_offset).
+    pub fn get_log_entry(&self, index: u64) -> Option<&LogEntry> {
+        if index == 0 || index <= self.persistent.log_offset {
+            return None;
+        }
+        let vec_index = (index - self.persistent.log_offset - 1) as usize;
+        self.persistent.log.get(vec_index)
+    }
+
+    /// Get the absolute index of the last log entry.
+    pub fn last_log_index(&self) -> u64 {
+        self.persistent.log_offset + self.persistent.log.len() as u64
+    }
+
+    /// Get the term of the last log entry (or 0 if log is empty).
+    pub fn last_log_term(&self) -> u64 {
+        self.persistent.log.last().map_or(0, |e| e.term)
+    }
+
+    /// Persist a snapshot to disk.
+    pub async fn persist_snapshot(&self, snapshot: &Snapshot) -> Result<(), std::io::Error> {
+        let data = serde_json::to_vec(snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Write to temp file then rename for atomicity
+        let temp_path = format!("{}.tmp", self.snapshot_path);
+        tokio::fs::write(&temp_path, data).await?;
+        tokio::fs::rename(&temp_path, &self.snapshot_path).await
+    }
+
+    /// Load snapshot from disk if it exists.
+    pub async fn load_snapshot(&self) -> Result<Option<Snapshot>, std::io::Error> {
+        match tokio::fs::read(&self.snapshot_path).await {
+            Ok(data) => {
+                let snapshot: Snapshot = serde_json::from_slice(&data)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(Some(snapshot))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 pub type AppendEntriesResponder =
     oneshot::Sender<Result<proto::AppendEntriesResponse, tonic::Status>>;
 pub type RequestVoteResponder = oneshot::Sender<Result<proto::RequestVoteResponse, tonic::Status>>;
 pub type ClientResponder = oneshot::Sender<Result<proto::SubmitCommandResponse, tonic::Status>>;
+pub type InstallSnapshotResponder =
+    oneshot::Sender<Result<proto::InstallSnapshotResponse, tonic::Status>>;
 
 #[derive(Debug)]
 pub enum RaftEvent {
@@ -127,5 +184,16 @@ pub enum RaftEvent {
     ClientRequest {
         command: proto::SubmitCommandRequest,
         responder: ClientResponder,
+    },
+
+    RpcInstallSnapshot {
+        request: proto::InstallSnapshotRequest,
+        responder: InstallSnapshotResponder,
+    },
+
+    InstallSnapshotResponse {
+        follower_id: String,
+        response: Result<proto::InstallSnapshotResponse, Status>,
+        snapshot_last_index: u64,
     },
 }

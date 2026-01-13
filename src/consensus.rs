@@ -2,9 +2,10 @@ use crate::proto::raft_client::RaftClient;
 use crate::proto::{
     self, AppendEntriesRequest, AppendEntriesResponse, LeaderInfo, RequestVoteRequest,
 };
+use crate::hash_table::Db;
 use crate::state::{
-    AppendEntriesResponder, ClientResponder, LogEntry, Peer, RaftEvent, RaftNode, RaftRole,
-    ReplicaProgress, RequestVoteResponder,
+    AppendEntriesResponder, ClientResponder, InstallSnapshotResponder, LogEntry, Peer, RaftEvent,
+    RaftNode, RaftRole, ReplicaProgress, RequestVoteResponder, Snapshot,
 };
 use futures::future;
 use prost::Message;
@@ -28,6 +29,8 @@ pub struct RaftConfig {
     pub election_timeout_max_ms: u64,
     pub backoff_base_ms: u64,
     pub backoff_max_ms: u64,
+    /// Create snapshot after this many applied entries (0 = disabled)
+    pub snapshot_interval: u64,
 }
 
 impl Default for RaftConfig {
@@ -38,6 +41,7 @@ impl Default for RaftConfig {
             election_timeout_max_ms: 3000,
             backoff_base_ms: 200,
             backoff_max_ms: 5000,
+            snapshot_interval: 1000,
         }
     }
 }
@@ -221,6 +225,7 @@ pub async fn run_raft_node(
                     responder,
                     reset_timer_tx.clone(),
                     &mut heartbeat_handle,
+                    &cfg,
                 )
                 .await;
             }
@@ -255,11 +260,36 @@ pub async fn run_raft_node(
                     response,
                     last_log_index_sent,
                     backoff.clone(),
+                    &cfg,
                 )
                 .await;
             }
             RaftEvent::ClientRequest { command, responder } => {
                 handle_client_request(node_arc.clone(), command, responder, event_tx.clone()).await;
+            }
+            RaftEvent::RpcInstallSnapshot { request, responder } => {
+                handle_rpc_install_snapshot(
+                    node_arc.clone(),
+                    request,
+                    responder,
+                    reset_timer_tx.clone(),
+                    &mut heartbeat_handle,
+                )
+                .await;
+            }
+            RaftEvent::InstallSnapshotResponse {
+                follower_id,
+                response,
+                snapshot_last_index,
+            } => {
+                handle_install_snapshot_response(
+                    node_arc.clone(),
+                    follower_id,
+                    response,
+                    snapshot_last_index,
+                    backoff.clone(),
+                )
+                .await;
             }
         }
     }
@@ -465,6 +495,7 @@ async fn handle_rpc_append_entries(
     responder: AppendEntriesResponder,
     reset_timer_tx: mpsc::Sender<()>,
     heartbeat_handle: &mut Option<JoinHandle<()>>,
+    cfg: &RaftConfig,
 ) {
     let mut node = node_arc.lock().await;
 
@@ -598,6 +629,7 @@ async fn handle_rpc_append_entries(
 
     if node.volatile.last_applied < node.volatile.commit_index {
         apply_committed_entries(&mut node);
+        maybe_create_snapshot(&mut node, cfg).await;
     }
 
     let response = proto::AppendEntriesResponse {
@@ -715,27 +747,51 @@ async fn handle_heartbeat_tick(
                 return;
             }
 
+            // Check if follower needs snapshot (entries were compacted)
+            let needs_snapshot = {
+                let node = node_arc_clone.lock().await;
+                progress.next_index <= node.persistent.log_offset
+            };
+
+            if needs_snapshot {
+                // Send InstallSnapshot instead of AppendEntries
+                send_install_snapshot(
+                    node_arc_clone,
+                    &follower_id,
+                    event_tx_clone,
+                    conn_mgr,
+                    backoff,
+                    &cfg,
+                )
+                .await;
+                return;
+            }
+
             let (request, last_log_index_sent) = {
                 let node = node_arc_clone.lock().await;
                 if node.volatile.role != RaftRole::Leader {
                     return;
                 }
 
+                let log_offset = node.persistent.log_offset;
                 let prev_log_index = progress.next_index.saturating_sub(1);
-                let prev_log_term = if prev_log_index > 0 {
-                    node.persistent
-                        .log
-                        .get((prev_log_index - 1) as usize)
-                        .map_or(0, |e| e.term)
+                let prev_log_term = if prev_log_index > 0 && prev_log_index > log_offset {
+                    node.get_log_entry(prev_log_index).map_or(0, |e| e.term)
                 } else {
                     0
                 };
 
-                let start_index = (progress.next_index - 1) as usize;
+                // Calculate start index in the log vector (accounting for offset)
+                let start_vec_index = if progress.next_index > log_offset {
+                    (progress.next_index - log_offset - 1) as usize
+                } else {
+                    0
+                };
+
                 let entries_to_send: Vec<proto::LogEntry> = node
                     .persistent
                     .log
-                    .get(start_index..)
+                    .get(start_vec_index..)
                     .unwrap_or(&[])
                     .iter()
                     .map(|e| proto::LogEntry {
@@ -791,6 +847,81 @@ async fn handle_heartbeat_tick(
     }
 }
 
+/// Send InstallSnapshot RPC to a slow follower.
+async fn send_install_snapshot(
+    node_arc: Arc<Mutex<RaftNode>>,
+    follower_id: &str,
+    event_tx: mpsc::Sender<RaftEvent>,
+    conn_mgr: Arc<ConnectionManager>,
+    backoff: Arc<FollowerBackoff>,
+    cfg: &RaftConfig,
+) {
+    // Load snapshot and build request
+    let request = {
+        let node = node_arc.lock().await;
+        if node.volatile.role != RaftRole::Leader {
+            return;
+        }
+
+        // Try to load snapshot from disk
+        match node.load_snapshot().await {
+            Ok(Some(snapshot)) => proto::InstallSnapshotRequest {
+                term: node.persistent.current_term,
+                leader_id: node.persistent.id.clone(),
+                last_included_index: snapshot.last_included_index,
+                last_included_term: snapshot.last_included_term,
+                data: snapshot.data,
+            },
+            Ok(None) => {
+                tracing::warn!(
+                    follower_id = %follower_id,
+                    "[Heartbeat] No snapshot available for slow follower"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "[Heartbeat] Failed to load snapshot");
+                return;
+            }
+        }
+    };
+
+    let snapshot_last_index = request.last_included_index;
+
+    match conn_mgr.get_client(follower_id).await {
+        Ok(mut client) => {
+            let resp = client
+                .install_snapshot(request)
+                .await
+                .map(|r| r.into_inner());
+
+            match &resp {
+                Ok(_) => {
+                    backoff.record_success(follower_id).await;
+                    tracing::debug!(follower_id = %follower_id, "InstallSnapshot sent successfully");
+                }
+                Err(e) => {
+                    backoff.record_failure(follower_id, cfg).await;
+                    tracing::warn!(follower_id = %follower_id, error = %e, "InstallSnapshot RPC failed");
+                }
+            }
+
+            let response_event = RaftEvent::InstallSnapshotResponse {
+                follower_id: follower_id.to_string(),
+                response: resp,
+                snapshot_last_index,
+            };
+            if event_tx.send(response_event).await.is_err() {
+                tracing::error!("[Heartbeat] Event channel closed");
+            }
+        }
+        Err(e) => {
+            backoff.record_failure(follower_id, cfg).await;
+            tracing::warn!(follower_id = %follower_id, error = %e, "Connection failed for InstallSnapshot");
+        }
+    }
+}
+
 #[tracing::instrument(skip_all)]
 async fn handle_append_entries_response(
     node_arc: Arc<Mutex<RaftNode>>,
@@ -799,6 +930,7 @@ async fn handle_append_entries_response(
     response: Result<AppendEntriesResponse, Status>,
     last_log_index_sent: u64,
     backoff: Arc<FollowerBackoff>,
+    cfg: &RaftConfig,
 ) {
     let mut node = node_arc.lock().await;
 
@@ -829,7 +961,7 @@ async fn handle_append_entries_response(
                         .values()
                         .map(|p| p.match_index)
                         .collect();
-                    match_indices.push(node.persistent.log.len() as u64);
+                    match_indices.push(node.last_log_index());
 
                     let majority_pos = leader_majority(available_followers.len()) - 1;
                     let potential_commit_index = if majority_pos < match_indices.len() {
@@ -841,14 +973,12 @@ async fn handle_append_entries_response(
                     };
 
                     if potential_commit_index > node.volatile.commit_index {
-                        if let Some(entry) = node
-                            .persistent
-                            .log
-                            .get((potential_commit_index - 1) as usize)
-                        {
+                        // Use log_offset-aware accessor
+                        if let Some(entry) = node.get_log_entry(potential_commit_index) {
                             if entry.term == node.persistent.current_term {
                                 node.volatile.commit_index = potential_commit_index;
                                 apply_committed_entries(&mut node);
+                                maybe_create_snapshot(&mut node, cfg).await;
                             }
                         }
                     }
@@ -856,15 +986,12 @@ async fn handle_append_entries_response(
                     if progress.next_index > 1 {
                         progress.next_index -= 1;
                     }
-                    backoff
-                        .record_failure(&follower_id, &RaftConfig::default())
-                        .await; // conservative if cfg not threaded here
+                    backoff.record_failure(&follower_id, cfg).await;
                 }
             }
         }
         Err(e) => {
-            backoff
-                .record_failure(&follower_id, &RaftConfig::default())
+            backoff.record_failure(&follower_id, cfg)
                 .await;
             tracing::warn!(follower_id = %follower_id, error = %e, "RPC to follower failed.");
         }
@@ -927,14 +1054,14 @@ fn apply_committed_entries(node: &mut RaftNode) {
     let commit_index = node.volatile.commit_index;
 
     for i in (node.volatile.last_applied + 1)..=commit_index {
-        let idx = (i - 1) as usize;
-        if let Some(entry) = node.persistent.log.get(idx) {
+        // Use the log_offset-aware accessor
+        if let Some(entry) = node.get_log_entry(i).cloned() {
             let result = match node.volatile.db.parse_command(entry.command.clone()) {
                 Ok(res) => Ok(res),
                 Err(e) => {
                     tracing::info!(error = %e, "Failed to parse command at log index {}", i);
                     Err(e.to_string())
-                },
+                }
             };
 
             if let Some(responder) = node.volatile.pending_requests.remove(&i) {
@@ -959,6 +1086,225 @@ fn apply_committed_entries(node: &mut RaftNode) {
             }
         }
         node.volatile.last_applied = i;
+    }
+}
+
+/// Create a snapshot if conditions are met (called after applying entries).
+async fn maybe_create_snapshot(node: &mut RaftNode, cfg: &RaftConfig) {
+    if cfg.snapshot_interval == 0 {
+        return; // Snapshotting disabled
+    }
+
+    let last_applied = node.volatile.last_applied;
+    let log_offset = node.persistent.log_offset;
+
+    // Check if we have enough entries since last snapshot
+    let entries_since_snapshot = last_applied.saturating_sub(log_offset);
+    if entries_since_snapshot < cfg.snapshot_interval {
+        return;
+    }
+
+    // Get the term of the last applied entry
+    let last_included_term = node
+        .get_log_entry(last_applied)
+        .map(|e| e.term)
+        .unwrap_or(0);
+
+    // Serialize the state machine (Db)
+    let db_data = match serde_json::to_vec(&node.volatile.db) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::error!(error = %e, "[Snapshot] Failed to serialize state machine");
+            return;
+        }
+    };
+
+    let snapshot = Snapshot {
+        last_included_index: last_applied,
+        last_included_term,
+        data: db_data,
+    };
+
+    // Persist snapshot to disk
+    if let Err(e) = node.persist_snapshot(&snapshot).await {
+        tracing::error!(error = %e, "[Snapshot] Failed to persist snapshot");
+        return;
+    }
+
+    // Truncate log: remove entries up to and including last_applied
+    let entries_to_remove = (last_applied - log_offset) as usize;
+    if entries_to_remove > 0 {
+        node.persistent.log.drain(0..entries_to_remove);
+        node.persistent.log_offset = last_applied;
+
+        // Persist the updated state (with truncated log)
+        if let Err(e) = node.persist().await {
+            tracing::error!(error = %e, "[Snapshot] Failed to persist state after log truncation");
+            return;
+        }
+    }
+
+    tracing::info!(
+        last_included_index = last_applied,
+        last_included_term,
+        log_size = node.persistent.log.len(),
+        "[Snapshot] Created snapshot and truncated log"
+    );
+}
+
+/// Handle InstallSnapshot RPC from leader (follower receiving snapshot).
+#[tracing::instrument(skip_all)]
+async fn handle_rpc_install_snapshot(
+    node_arc: Arc<Mutex<RaftNode>>,
+    request: proto::InstallSnapshotRequest,
+    responder: InstallSnapshotResponder,
+    reset_timer_tx: mpsc::Sender<()>,
+    heartbeat_handle: &mut Option<JoinHandle<()>>,
+) {
+    let mut node = node_arc.lock().await;
+
+    tracing::info!(
+        "[RPC InstallSnapshot] Received: term={}, last_included_index={}, leader_id={}",
+        request.term,
+        request.last_included_index,
+        request.leader_id
+    );
+
+    // Reject if term < current_term
+    if request.term < node.persistent.current_term {
+        tracing::debug!(
+            "[RPC InstallSnapshot] Reject: term {} < {}",
+            request.term,
+            node.persistent.current_term
+        );
+        let _ = responder.send(Ok(proto::InstallSnapshotResponse {
+            term: node.persistent.current_term,
+        }));
+        return;
+    }
+
+    // Valid leader contact - reset election timer
+    node.volatile.leader_hint = request.leader_id.clone();
+    let _ = reset_timer_tx.send(()).await;
+
+    // Step down if higher term
+    if request.term > node.persistent.current_term {
+        tracing::debug!(
+            "[State] Higher term {} seen (ours {}). Stepping down.",
+            request.term,
+            node.persistent.current_term
+        );
+        stop_heartbeat(heartbeat_handle);
+        node.persistent.current_term = request.term;
+        node.persistent.voted_for = None;
+        node.volatile.role = RaftRole::Follower;
+    }
+
+    // Check if snapshot is newer than our current state
+    if request.last_included_index <= node.persistent.log_offset {
+        tracing::debug!(
+            "[RPC InstallSnapshot] Snapshot not newer: snapshot_index={} <= log_offset={}",
+            request.last_included_index,
+            node.persistent.log_offset
+        );
+        let _ = responder.send(Ok(proto::InstallSnapshotResponse {
+            term: node.persistent.current_term,
+        }));
+        return;
+    }
+
+    // Deserialize the state machine from snapshot
+    let new_db: Db = match serde_json::from_slice(&request.data) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::error!(error = %e, "[RPC InstallSnapshot] Failed to deserialize snapshot");
+            let _ = responder.send(Err(tonic::Status::internal("Failed to deserialize snapshot")));
+            return;
+        }
+    };
+
+    // Create and persist the snapshot
+    let snapshot = Snapshot {
+        last_included_index: request.last_included_index,
+        last_included_term: request.last_included_term,
+        data: request.data,
+    };
+
+    if let Err(e) = node.persist_snapshot(&snapshot).await {
+        tracing::error!(error = %e, "[RPC InstallSnapshot] Failed to persist snapshot");
+        let _ = responder.send(Err(tonic::Status::internal("Failed to persist snapshot")));
+        return;
+    }
+
+    // Update state machine
+    node.volatile.db = new_db;
+    node.volatile.last_applied = request.last_included_index;
+    node.volatile.commit_index = request.last_included_index;
+
+    // Discard entire log and update offset
+    node.persistent.log.clear();
+    node.persistent.log_offset = request.last_included_index;
+
+    // Persist updated state
+    if let Err(e) = node.persist().await {
+        tracing::error!(error = %e, "[RPC InstallSnapshot] Failed to persist state");
+        let _ = responder.send(Err(tonic::Status::internal("Failed to persist state")));
+        return;
+    }
+
+    tracing::info!(
+        "[RPC InstallSnapshot] Applied snapshot at index {}",
+        request.last_included_index
+    );
+
+    let _ = responder.send(Ok(proto::InstallSnapshotResponse {
+        term: node.persistent.current_term,
+    }));
+}
+
+/// Handle response from InstallSnapshot RPC (leader processing follower's response).
+#[tracing::instrument(skip_all)]
+async fn handle_install_snapshot_response(
+    node_arc: Arc<Mutex<RaftNode>>,
+    follower_id: String,
+    response: Result<proto::InstallSnapshotResponse, Status>,
+    snapshot_last_index: u64,
+    backoff: Arc<FollowerBackoff>,
+) {
+    let mut node = node_arc.lock().await;
+
+    if node.volatile.role != RaftRole::Leader {
+        return;
+    }
+
+    match response {
+        Ok(resp) => {
+            if resp.term > node.persistent.current_term {
+                node.persistent.current_term = resp.term;
+                node.volatile.role = RaftRole::Follower;
+                node.persistent.voted_for = None;
+                let _ = persist_or_log(&mut node, "stepping down on higher term").await;
+                return;
+            }
+
+            // Snapshot installed successfully - update follower progress
+            if let Some(progress) = node.volatile.replicas.get_mut(&follower_id) {
+                backoff.record_success(&follower_id).await;
+                progress.match_index = snapshot_last_index;
+                progress.next_index = snapshot_last_index + 1;
+                tracing::info!(
+                    follower_id = %follower_id,
+                    next_index = progress.next_index,
+                    "[InstallSnapshot] Follower caught up via snapshot"
+                );
+            }
+        }
+        Err(e) => {
+            backoff
+                .record_failure(&follower_id, &RaftConfig::default())
+                .await;
+            tracing::warn!(follower_id = %follower_id, error = %e, "InstallSnapshot RPC failed");
+        }
     }
 }
 

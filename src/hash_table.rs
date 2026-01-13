@@ -1,8 +1,9 @@
 use crate::parser;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
 
-#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Table {
     User,
 }
@@ -26,7 +27,7 @@ impl FromStr for Table {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Debug, Clone)]
+#[derive(PartialEq, Eq, Hash, Debug, Clone, Serialize, Deserialize)]
 pub enum Column {
     Username,
     Password,
@@ -48,6 +49,7 @@ type Row = HashMap<Column, String>;
 type PrimaryKey = String;
 type TableData = HashMap<PrimaryKey, Row>;
 
+#[derive(Serialize, Deserialize)]
 pub struct Db {
     tables: HashMap<Table, TableData>,
 }
