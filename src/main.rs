@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             volatile: RaftVolatileState::default(),
             state_path: config.state_file.clone(),
         };
-        node.persist()?;
+        node.persist().await?;
         node
     };
     let shared_node_state = Arc::new(Mutex::new(node_state));

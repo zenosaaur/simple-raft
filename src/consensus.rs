@@ -12,7 +12,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use tonic::{Status, transport::Channel};
@@ -43,8 +43,7 @@ impl Default for RaftConfig {
 }
 
 fn rand_timeout_ms(cfg: &RaftConfig) -> u64 {
-    let mut rng = rand::thread_rng();
-    rng.gen_range(cfg.election_timeout_min_ms..=cfg.election_timeout_max_ms)
+    rand::rng().random_range(cfg.election_timeout_min_ms..=cfg.election_timeout_max_ms)
 }
 
 #[inline]
@@ -58,7 +57,7 @@ fn leader_majority(followers: usize) -> usize {
 }
 
 async fn persist_or_log(node: &mut RaftNode, context: &str) -> Result<(), std::io::Error> {
-    node.persist().map_err(|e| {
+    node.persist().await.map_err(|e| {
         tracing::error!(error = %e, "[Persist] CRITICAL failure while {context}");
         e
     })
@@ -133,18 +132,18 @@ impl BackoffState {
 
 #[derive(Default)]
 pub struct FollowerBackoff {
-    inner: Mutex<HashMap<String, BackoffState>>, // follower_id -> state
+    inner: RwLock<HashMap<String, BackoffState>>, // follower_id -> state
 }
 
 impl FollowerBackoff {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: RwLock::new(HashMap::new()),
         }
     }
 
     pub async fn allow_now(&self, follower: &str) -> bool {
-        let map: tokio::sync::MutexGuard<'_, HashMap<String, BackoffState>> = self.inner.lock().await;
+        let map = self.inner.read().await;
         match map.get(follower) {
             None => true,
             Some(st) => Instant::now() >= st.next_attempt_at,
@@ -152,7 +151,7 @@ impl FollowerBackoff {
     }
 
     pub async fn record_success(&self, follower: &str) {
-        let mut map = self.inner.lock().await;
+        let mut map = self.inner.write().await;
         let st = map
             .entry(follower.to_string())
             .or_insert_with(BackoffState::new);
@@ -161,7 +160,7 @@ impl FollowerBackoff {
     }
 
     pub async fn record_failure(&self, follower: &str, cfg: &RaftConfig) {
-        let mut map = self.inner.lock().await;
+        let mut map = self.inner.write().await;
         let st = map
             .entry(follower.to_string())
             .or_insert_with(BackoffState::new);
@@ -172,7 +171,7 @@ impl FollowerBackoff {
         let backoff_ms = (base << (pow - 1).max(0)) // base * 2^(n-1)
             .min(max);
         // jitter 0..base
-        let jitter = rand::thread_rng().gen_range(0..=cfg.backoff_base_ms);
+        let jitter = rand::rng().random_range(0..=cfg.backoff_base_ms);
         let delay = Duration::from_millis(backoff_ms + jitter as u64);
         st.next_attempt_at = Instant::now() + delay;
         tracing::trace!(
@@ -425,8 +424,8 @@ async fn handle_election_timeout(
     if node.volatile.role == RaftRole::Candidate
         && votes_received >= leader_majority(available_followers.len())
     {
-        tracing::debug!(
-            "[State] Election WIN! Became LEADER for term {} with {} votes.",
+        println!(
+            "[State] 👑 Election WIN!  Became LEADER for term {} with {} votes.",
             node.persistent.current_term,
             votes_received
         );
@@ -690,20 +689,20 @@ async fn handle_heartbeat_tick(
     conn_mgr: Arc<ConnectionManager>,
     backoff: Arc<FollowerBackoff>,
 ) {
-    let (replicas, is_leader, current_term) = {
+    // Only clone keys and progress values, not the entire HashMap
+    let replica_entries: Vec<(String, ReplicaProgress)> = {
         let node = node_arc.lock().await;
-        (
-            node.volatile.replicas.clone(),
-            node.volatile.role == RaftRole::Leader,
-            node.persistent.current_term,
-        )
+        if node.volatile.role != RaftRole::Leader {
+            return;
+        }
+        node.volatile
+            .replicas
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     };
 
-    if !is_leader {
-        return;
-    }
-
-    for (follower_id, progress) in replicas {
+    for (follower_id, progress) in replica_entries {
         let node_arc_clone = Arc::clone(&node_arc);
         let event_tx_clone = event_tx.clone();
         let conn_mgr = conn_mgr.clone();
@@ -823,6 +822,7 @@ async fn handle_append_entries_response(
                     progress.match_index = last_log_index_sent;
                     progress.next_index = progress.match_index + 1;
 
+                    // Use select_nth_unstable for O(n) instead of O(n log n) sort
                     let mut match_indices: Vec<u64> = node
                         .volatile
                         .replicas
@@ -830,10 +830,15 @@ async fn handle_append_entries_response(
                         .map(|p| p.match_index)
                         .collect();
                     match_indices.push(node.persistent.log.len() as u64);
-                    match_indices.sort_unstable_by(|a, b| b.cmp(a));
 
                     let majority_pos = leader_majority(available_followers.len()) - 1;
-                    let potential_commit_index = *match_indices.get(majority_pos).unwrap_or(&0);
+                    let potential_commit_index = if majority_pos < match_indices.len() {
+                        // select_nth_unstable_by partitions so that element at pos is in sorted position
+                        match_indices.select_nth_unstable_by(majority_pos, |a, b| b.cmp(a));
+                        match_indices[majority_pos]
+                    } else {
+                        0
+                    };
 
                     if potential_commit_index > node.volatile.commit_index {
                         if let Some(entry) = node
@@ -949,7 +954,7 @@ fn apply_committed_entries(node: &mut RaftNode) {
                 let request_key = (entry.client_id.clone(), entry.request_id);
                 node.volatile
                     .idempotency_cache
-                    .insert(request_key, response.clone());
+                    .put(request_key, response.clone());
                 let _ = responder.send(Ok(response));
             }
         }

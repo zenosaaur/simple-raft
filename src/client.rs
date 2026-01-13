@@ -91,8 +91,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // Monotonic per-client request id
         let request_id = state.last_request_id.wrapping_add(1);
         if let Ok(parsed_command) = parser::parse_commands(trimmed_input) {
-            let command_request = proto::SubmitCommandRequest {
-                client_id: "desktop-client-01".to_string(),
+            let command_request: proto::SubmitCommandRequest = proto::SubmitCommandRequest {
+                client_id: client_id.clone(),
                 request_id,
                 command: trimmed_input.to_string(),
             };
@@ -116,7 +116,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     Ok(leader_info) => {
                                         let leader = leader_info.leader_address;
                                         let new_url = normalize_url(&leader);
-                                        println!("Redirecting to {}...", new_url);
                                         url = new_url;
                                         client = connect(&url).await?;
                                         redirected = true; // retry same input on next loop

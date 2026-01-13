@@ -19,6 +19,7 @@ tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 uuid = { version = "1.17.0", features = ["v4","serde"] }   
 winnow = "0.7.13"
+lru = "0.12"
 
 [build-dependencies]
 tonic-build = "0.11"

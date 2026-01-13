@@ -1,9 +1,13 @@
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs::File};
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use tokio::sync::oneshot;
 use tonic::Status;
 
 use crate::{hash_table::Db, proto};
+
+const IDEMPOTENCY_CACHE_SIZE: usize = 10_000;
 
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, Default, PartialEq)]
 pub enum RaftRole {
@@ -53,7 +57,6 @@ pub struct ReplicaProgress {
     pub match_index: u64,
 }
 
-#[derive(Default)]
 pub struct RaftVolatileState {
     pub db: Db,
     pub role: RaftRole,
@@ -62,7 +65,24 @@ pub struct RaftVolatileState {
     pub replicas: HashMap<String, ReplicaProgress>,
     pub leader_hint: String,
     pub pending_requests: HashMap<u64, ClientResponder>,
-    pub idempotency_cache: HashMap<(String, u64), proto::SubmitCommandResponse>,
+    pub idempotency_cache: LruCache<(String, u64), proto::SubmitCommandResponse>,
+}
+
+impl Default for RaftVolatileState {
+    fn default() -> Self {
+        Self {
+            db: Db::default(),
+            role: RaftRole::default(),
+            commit_index: 0,
+            last_applied: 0,
+            replicas: HashMap::new(),
+            leader_hint: String::new(),
+            pending_requests: HashMap::new(),
+            idempotency_cache: LruCache::new(
+                NonZeroUsize::new(IDEMPOTENCY_CACHE_SIZE).unwrap()
+            ),
+        }
+    }
 }
 
 pub struct RaftNode {
@@ -72,10 +92,10 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-    pub fn persist(&self) -> Result<(), std::io::Error> {
-        let file = File::create(self.state_path.as_str())?;
-        serde_json::to_writer_pretty(file, &self.persistent)?;
-        Ok(())
+    pub async fn persist(&self) -> Result<(), std::io::Error> {
+        let data = serde_json::to_vec(&self.persistent)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        tokio::fs::write(&self.state_path, data).await
     }
 }
 
